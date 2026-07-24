@@ -35,6 +35,7 @@
 - UPI 零元路径优先使用 Go Elements/B 引擎，执行 IN → VN → IN 路由、inline confirm、approval 与结果轮询。
 - 支持失败重试，每轮重建 Checkout、设备标识和支付参数。
 - 提供全局 RPM、单 IP RPM、并发限制和任务排队。
+- 提供不出现在公开导航中的私有直通页，使用独立执行池，不占用公开队列与 RPM。
 - 支持停止任务、进度展示、精简前端日志和完整后台日志。
 - 支持支付二维码、跳转链接、倒计时和结果复制。
 - 深色/浅色主题，以及桌面端和手机端响应式布局。
@@ -109,6 +110,9 @@ cp .env.example .env
 | `PAY153_IP_RPM` | 单 IP 每分钟任务上限 |
 | `PAY153_LOG_DIR` | 完整后台日志目录 |
 | `PAY153_LEGACY_BASE` | 旧服务兼容地址，可选 |
+| `PAY153_INTERNAL_KEY` | 内部 API 请求头校验密钥 |
+| `PAY153_PRIVATE_PAGE_KEY` | 私有直通页首次访问密钥，与内部 API 密钥分离 |
+| `PAY153_INTERNAL_WORKERS` | 私有直通独立执行池并发数，默认 `5` |
 | `PAY153_UPI_GO_BINARY` | UPI Go 二进制路径，默认 `tools/upi_go/pix_extract_slot` |
 | `PAY153_UPI_GO_PROMO_COUNTRY` | UPI 优惠更新地区，默认 `VN` |
 | `PAY153_UPI_GO_EFFECTIVE_RETRIES` | 单次 Flask 尝试内的 Go 有效尝试数，默认 `1` |

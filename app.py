@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, redirect, request, send_from_directory
 from curl_cffi import requests
 
 import stripe_checkout as sc
@@ -707,6 +707,8 @@ class JobStore:
         self.worker_limit = max(1, int(os.getenv("PAY153_WORKERS", "20")))
         self.global_rpm = max(1, int(os.getenv("PAY153_GLOBAL_RPM", "20")))
         self.pool = ThreadPoolExecutor(max_workers=self.worker_limit)
+        self.internal_worker_limit = max(1, int(os.getenv("PAY153_INTERNAL_WORKERS", "5")))
+        self.internal_pool = ThreadPoolExecutor(max_workers=self.internal_worker_limit)
         self.pending: deque[tuple[str, dict]] = deque()
         self.start_times: deque[float] = deque()
         self.active_workers = 0
@@ -779,6 +781,12 @@ class JobStore:
             self.active_workers = max(0, self.active_workers - 1)
             self.condition.notify_all()
 
+    def _internal_worker_done(self, _future):
+        # The private lane has its own executor and never consumes public
+        # queue/RPM slots. ThreadPoolExecutor owns its internal worker count.
+        with self.condition:
+            self.condition.notify_all()
+
     def _dispatch_loop(self):
         while True:
             with self.condition:
@@ -835,19 +843,23 @@ class JobStore:
             options = dict(options)
             options["_internal_request"] = bool(internal)
             if internal:
-                insert_at = 0
-                for _pending_id, pending_options in self.pending:
-                    if not bool(pending_options.get("_internal_request")):
-                        break
-                    insert_at += 1
-                self.pending.insert(insert_at, (job_id, options))
-                self.jobs[job_id]["internal"] = True
-                self.jobs[job_id]["text"] = "内部任务已创建，等待专用调度"
+                self.jobs[job_id].update(
+                    internal=True,
+                    dispatched=True,
+                    queue_position=0,
+                    text="私有直通任务已提交",
+                )
+                future = self.internal_pool.submit(self._run, job_id, options)
+                future.add_done_callback(self._internal_worker_done)
             else:
                 self.pending.append((job_id, options))
             self._refresh_queue_locked()
             self.condition.notify_all()
-        self._append_backend_log(job_id, "SYSTEM", "任务已创建并进入队列")
+        self._append_backend_log(
+            job_id,
+            "SYSTEM",
+            "私有直通任务已提交到独立执行池" if internal else "任务已创建并进入队列",
+        )
         return job_id
 
     def queue_position(self, job_id: str) -> int:
@@ -1644,6 +1656,37 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
+def _internal_key_valid(value: str) -> bool:
+    expected = str(os.getenv("PAY153_INTERNAL_KEY") or "").strip()
+    supplied = str(value or "").strip()
+    return bool(expected and supplied and hmac.compare_digest(supplied, expected))
+
+
+def _private_page_key_valid(value: str) -> bool:
+    expected = str(os.getenv("PAY153_PRIVATE_PAGE_KEY") or "").strip()
+    supplied = str(value or "").strip()
+    return bool(expected and supplied and hmac.compare_digest(supplied, expected))
+
+
+@app.get("/private-checkout")
+def private_checkout_page():
+    bootstrap_key = str(request.args.get("key") or "").strip()
+    if _private_page_key_valid(bootstrap_key):
+        response = redirect("/private-checkout", code=302)
+        response.set_cookie(
+            "pay153_private_lane",
+            bootstrap_key,
+            max_age=30 * 24 * 60 * 60,
+            secure=True,
+            httponly=True,
+            samesite="Strict",
+        )
+        return response
+    if not _private_page_key_valid(request.cookies.get("pay153_private_lane") or ""):
+        return "Not Found", 404
+    return send_from_directory(app.static_folder, "index.html")
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "pay153", "time": int(time.time())})
@@ -1677,12 +1720,9 @@ def config():
 @app.post("/api/checkout")
 def start_checkout():
     data = request.get_json(silent=True) or {}
-    expected_internal_key = str(os.getenv("PAY153_INTERNAL_KEY") or "").strip()
-    supplied_internal_key = str(request.headers.get("X-Pay153-Internal-Key") or "").strip()
     internal_request = bool(
-        expected_internal_key
-        and supplied_internal_key
-        and hmac.compare_digest(supplied_internal_key, expected_internal_key)
+        _internal_key_valid(request.headers.get("X-Pay153-Internal-Key") or "")
+        or _private_page_key_valid(request.cookies.get("pay153_private_lane") or "")
     )
     plan = str(data.get("plan") or "plus").lower()
     link_type = str(data.get("link_type") or "hosted").lower()

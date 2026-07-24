@@ -1,5 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const form = $('checkoutForm');
+const privateMode = location.pathname.replace(/\/+$/, '') === '/private-checkout';
 let jobId = '';
 let pollTimer = 0;
 let countdownTimer = 0;
@@ -262,7 +263,8 @@ form.addEventListener('submit', async (event) => {
     const r = await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const data = await r.json(); if(!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
     jobId = data.job_id;
-    if (data.queue_position > 0) setProgress(2, `任务已进入队列，当前第 ${data.queue_position} 位`, 'queued');
+    if (data.internal) setProgress(4, '私有直通任务已进入独立执行池', 'running');
+    else if (data.queue_position > 0) setProgress(2, `任务已进入队列，当前第 ${data.queue_position} 位`, 'queued');
     clearInterval(pollTimer); await poll(); pollTimer=setInterval(poll,1200);
   }catch(e){ setRunning(false); setProgress(100,e.message||String(e),'error'); }
 });
@@ -287,6 +289,18 @@ const requestedTheme = new URLSearchParams(location.search).get('theme');
 const saved=localStorage.getItem('pay153-theme');
 applyTheme(requestedTheme ? requestedTheme === 'dark' : (saved ? saved==='dark' : matchMedia('(prefers-color-scheme: dark)').matches));
 $('themeToggle').addEventListener('click',()=>applyTheme(!document.documentElement.classList.contains('dark')));
+if (privateMode) {
+  document.body.classList.add('private-mode');
+  document.title = 'PAY.153 · 私有直通提链';
+  const brand = document.querySelector('.brand');
+  if (brand) brand.href = '/private-checkout';
+  const modeLabel = document.querySelector('.form-panel .panel-heading .quiet');
+  if (modeLabel) modeLabel.textContent = '私有直通工作台';
+  const limitNote = document.querySelector('.public-limit-note');
+  if (limitNote) limitNote.innerHTML = '<b>私有直通通道</b><span>使用独立任务执行池，不占用公开队列名额，也不受公开 RPM 与单 IP 限制。</span>';
+  const rateCard = document.querySelector('.hero-board > div:nth-child(2)');
+  if (rateCard) rateCard.innerHTML = '<small>PRIVATE LANE</small><strong>DIRECT</strong><span>独立执行池</span>';
+}
 syncFields(true);
 restoreProxyPools();
 updateProxyCount($('entryProxy'), $('entryProxyCount'));
