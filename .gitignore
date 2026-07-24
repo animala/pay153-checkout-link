@@ -13,3 +13,5 @@ backups/
 *.jsonl
 *.zip
 node_modules/
+tools/upi_go/pix_extract_slot
+tools/upi_go/pix_extract_slot.exe

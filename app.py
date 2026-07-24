@@ -24,6 +24,7 @@ from curl_cffi import requests
 import stripe_checkout as sc
 from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
 from sentinel_token import SentinelTokenProvider as BaseSentinel
+from upi_go_runner import available as upi_go_available, run_upi as run_upi_go
 
 
 ROOT = Path(__file__).resolve().parent
@@ -985,7 +986,11 @@ class JobStore:
                 strategy_cycle = (
                     ("standalone", "late_promo", "inline")
                     if current.get("link_type") == "pix"
-                    else ("standalone", "inline", "late_promo")
+                    else (
+                        ("go_b", "go_b", "inline", "late_promo")
+                        if current.get("use_promo", False)
+                        else ("standalone", "inline")
+                    )
                 )
                 current["local_method_strategy"] = strategy_cycle[(attempt - 1) % len(strategy_cycle)]
                 # Creating the Checkout at zero due removes PIX/UPI from this
@@ -1152,6 +1157,58 @@ class JobStore:
                     options["promo_campaign_verified"] = True
                     self.log(job_id, f"优惠预检已匹配账号活动：{detected_campaign}")
                 self.ensure_not_cancelled(job_id)
+
+            if (
+                provider == "upi"
+                and promo_requested
+                and options.get("local_method_strategy") == "go_b"
+            ):
+                if not upi_go_available():
+                    raise RuntimeError("UPI Go Elements/B 引擎未安装")
+                self.update(job_id, percent=22, text="UPI Go：准备印度账单与代理路由")
+                upi_billing = default_billing("IN", meta.get("email") or "")
+                upi_address = upi_billing.get("address") or {}
+                self.log(
+                    job_id,
+                    "UPI Go 账单：城市={}，州={}，邮编={}".format(
+                        upi_address.get("city") or "-",
+                        upi_address.get("state") or "-",
+                        upi_address.get("postal_code") or "-",
+                    ),
+                )
+                self.update(job_id, percent=34, text="UPI Go：创建零元 Checkout")
+                go_result = run_upi_go(
+                    token=token,
+                    proxy=exit_proxy,
+                    billing=upi_billing,
+                    promotion_country=str(os.getenv("PAY153_UPI_GO_PROMO_COUNTRY") or "VN"),
+                    timeout_seconds=int(os.getenv("PAY153_UPI_GO_REQUEST_TIMEOUT", "45") or 45),
+                    cancelled=lambda: self.cancelled(job_id),
+                    log=lambda message: self.log(job_id, message),
+                )
+                self.ensure_not_cancelled(job_id)
+                result: dict[str, Any] = {
+                    "plan": options["plan"],
+                    "link_type": "upi",
+                    "account_email": meta.get("email") or "",
+                    "account_id": meta.get("account_id") or "",
+                    "country": "IN",
+                    "currency": str(go_result.get("checkout_currency") or "INR").upper(),
+                    "checkout_country": "IN",
+                    "checkout_currency": str(go_result.get("checkout_currency") or "INR").upper(),
+                    "entry_proxy_pool_size": len(entry_pool),
+                    "exit_proxy_pool_size": len(exit_pool),
+                    "proxy_mode": "go_region_route",
+                    "promo_requested": True,
+                    "promo_applied": go_result.get("promo_applied"),
+                    "promo_campaign_used": options.get("promo_campaign") or "plus-1-month-free",
+                    "entry_trial_eligible": preflight.get("one_click_trial_eligible"),
+                    "entry_country": str(main_country or "").upper(),
+                    "payment_proxy_country": str(payment_country or "").upper(),
+                }
+                result.update(go_result)
+                self.update(job_id, percent=100, text="UPI 提取完成", status="done", result=result)
+                return
 
             self.update(job_id, percent=18, text="生成 Sentinel 校验")
             payload = checkout_payload(options, meta)

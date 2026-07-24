@@ -32,6 +32,7 @@
 - 双代理池、1–500 条代理、本地保存、代理检测和地区自适应。
 - 按支付地区自动选择币种，并处理不受支持币种的回退逻辑。
 - 支持优惠更新、金额重新校验与零元账单判断。
+- UPI 零元路径优先使用 Go Elements/B 引擎，执行 IN → VN → IN 路由、inline confirm、approval 与结果轮询。
 - 支持失败重试，每轮重建 Checkout、设备标识和支付参数。
 - 提供全局 RPM、单 IP RPM、并发限制和任务排队。
 - 支持停止任务、进度展示、精简前端日志和完整后台日志。
@@ -55,6 +56,8 @@ pay153-checkout-link/
 ├─ app.py                       # Flask API、任务队列、限流与入口
 ├─ provider_checkout.py         # Checkout、地区、账单与支付提供商流程
 ├─ stripe_checkout.py           # Stripe 初始化、金额、确认与跳转处理
+├─ upi_go_runner.py             # UPI Go 子进程封装、取消和结果映射
+├─ tools/upi_go/                # UPI Elements/B Go 源码
 ├─ billing_address_resolver.py  # 在线地图及账单地址解析
 ├─ sentinel_token.py            # Sentinel Token 生成与请求封装
 ├─ sentinel_sdk_full.js         # Sentinel SDK/VM 辅助代码
@@ -106,6 +109,9 @@ cp .env.example .env
 | `PAY153_IP_RPM` | 单 IP 每分钟任务上限 |
 | `PAY153_LOG_DIR` | 完整后台日志目录 |
 | `PAY153_LEGACY_BASE` | 旧服务兼容地址，可选 |
+| `PAY153_UPI_GO_BINARY` | UPI Go 二进制路径，默认 `tools/upi_go/pix_extract_slot` |
+| `PAY153_UPI_GO_PROMO_COUNTRY` | UPI 优惠更新地区，默认 `VN` |
+| `PAY153_UPI_GO_EFFECTIVE_RETRIES` | 单次 Flask 尝试内的 Go 有效尝试数，默认 `1` |
 
 ## 代理池
 
