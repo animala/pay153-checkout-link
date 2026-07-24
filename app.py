@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -788,7 +789,9 @@ class JobStore:
                     self.condition.wait(timeout=1)
                     continue
 
-                if len(self.start_times) >= self.global_rpm:
+                next_job_id, next_options = self.pending[0]
+                next_internal = bool(next_options.get("_internal_request"))
+                if not next_internal and len(self.start_times) >= self.global_rpm:
                     wait_seconds = max(0.1, 60 - (now - self.start_times[0]))
                     self.condition.wait(timeout=min(wait_seconds, 2))
                     continue
@@ -802,13 +805,14 @@ class JobStore:
                     continue
 
                 self.active_workers += 1
-                self.start_times.append(now)
+                if not bool(options.get("_internal_request")):
+                    self.start_times.append(now)
                 job.update(text="排队完成，即将开始", queue_position=0, dispatched=True, updated_at=now)
                 self._refresh_queue_locked()
                 future = self.pool.submit(self._run, job_id, options)
                 future.add_done_callback(self._worker_done)
 
-    def create(self, options: dict) -> str:
+    def create(self, options: dict, *, internal: bool = False) -> str:
         job_id = uuid.uuid4().hex[:16]
         now = time.time()
         with self.lock:
@@ -827,7 +831,19 @@ class JobStore:
                 "logs": [], "result": None, "error": "", "cancel": False,
                 "created_at": now, "updated_at": now, "queue_position": 0, "dispatched": False,
             }
-            self.pending.append((job_id, options))
+            options = dict(options)
+            options["_internal_request"] = bool(internal)
+            if internal:
+                insert_at = 0
+                for _pending_id, pending_options in self.pending:
+                    if not bool(pending_options.get("_internal_request")):
+                        break
+                    insert_at += 1
+                self.pending.insert(insert_at, (job_id, options))
+                self.jobs[job_id]["internal"] = True
+                self.jobs[job_id]["text"] = "内部任务已创建，等待专用调度"
+            else:
+                self.pending.append((job_id, options))
             self._refresh_queue_locked()
             self.condition.notify_all()
         self._append_backend_log(job_id, "SYSTEM", "任务已创建并进入队列")
@@ -1604,6 +1620,13 @@ def config():
 @app.post("/api/checkout")
 def start_checkout():
     data = request.get_json(silent=True) or {}
+    expected_internal_key = str(os.getenv("PAY153_INTERNAL_KEY") or "").strip()
+    supplied_internal_key = str(request.headers.get("X-Pay153-Internal-Key") or "").strip()
+    internal_request = bool(
+        expected_internal_key
+        and supplied_internal_key
+        and hmac.compare_digest(supplied_internal_key, expected_internal_key)
+    )
     plan = str(data.get("plan") or "plus").lower()
     link_type = str(data.get("link_type") or "hosted").lower()
     if plan not in PLANS:
@@ -1626,7 +1649,7 @@ def start_checkout():
         return jsonify({"error": "当前支付路径需要填写支付出口代理"}), 400
     try:
         entry_proxies = normalize_proxy_pool(entry_raw, "入口代理")
-        exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw and link_type != "pix" else []
+        exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw else []
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     if not entry_proxies:
@@ -1664,7 +1687,7 @@ def start_checkout():
         "checkout_country": country,
         "checkout_currency": currency,
         "entry_proxies": entry_proxies,
-        "exit_proxies": entry_proxies if link_type == "pix" else exit_proxies,
+        "exit_proxies": (exit_proxies or entry_proxies) if link_type == "pix" else exit_proxies,
         "use_promo": bool(data.get("use_promo", True)) if plan == "plus" else False,
         "promo_campaign": str(data.get("promo_campaign") or "") if plan == "plus" else "",
         "promo_code": str(data.get("promo_code") or "") if plan == "team" else "",
@@ -1685,23 +1708,25 @@ def start_checkout():
         return jsonify({"error": "请填写 Access Token 或 Session JSON"}), 400
     if link_type == "pix" and options["pix_tax_id"] and len(options["pix_tax_id"]) not in {11, 14}:
         return jsonify({"error": "PIX 需要填写 11 位 CPF 或 14 位 CNPJ"}), 400
-    client_ip = request_client_ip()
-    allowed, retry_after = IP_TASK_LIMITER.acquire(client_ip)
-    if not allowed:
-        response = jsonify({
-            "error": f"当前 IP 每分钟最多创建 {IP_TASK_LIMITER.limit} 个任务，请在 {retry_after} 秒后重试。",
-            "retry_after": retry_after,
-            "limit": IP_TASK_LIMITER.limit,
-        })
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
-    job_id = STORE.create(options)
+    if not internal_request:
+        client_ip = request_client_ip()
+        allowed, retry_after = IP_TASK_LIMITER.acquire(client_ip)
+        if not allowed:
+            response = jsonify({
+                "error": f"当前 IP 每分钟最多创建 {IP_TASK_LIMITER.limit} 个任务，请在 {retry_after} 秒后重试。",
+                "retry_after": retry_after,
+                "limit": IP_TASK_LIMITER.limit,
+            })
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
+    job_id = STORE.create(options, internal=internal_request)
     return jsonify({
         "ok": True,
         "job_id": job_id,
         "queue_position": STORE.queue_position(job_id),
         "global_rpm": STORE.global_rpm,
         "ip_rpm": IP_TASK_LIMITER.limit,
+        "internal": internal_request,
     }), 202
 
 

@@ -7,7 +7,7 @@ import random
 import re
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from datetime import date, timedelta
 from typing import Any, Callable
 
@@ -880,13 +880,34 @@ def confirm_provider_payment(
     return resp.json()
 
 
+
+def canonical_ideal_payment_url(value: str) -> str:
+    """Return the public iDEAL payment page instead of the raw tx endpoint."""
+    raw = str(value or "").strip()
+    if not raw:
+        return raw
+    parsed = urlsplit(raw)
+    host = parsed.netloc.lower().rstrip(".")
+    if host == "pay.ideal.nl" and "/transactions/" in parsed.path:
+        return raw
+    if host == "tx.ideal.nl":
+        transaction_url = f"{parsed.scheme or 'https'}://{parsed.netloc}{parsed.path}"
+        wrapped = "https://pay.ideal.nl/transactions/" + quote(transaction_url, safe="")
+        if parsed.query:
+            wrapped += "?" + parsed.query
+        return wrapped
+    return raw
+
 def enrich_ideal_redirect(http, redirect_url: str, log: Callable[[str], None]) -> dict[str, Any]:
     """Resolve the iDEAL hosted page and extract its Canvas QR payload."""
     if not redirect_url:
         return {}
     try:
+        hosted_url = canonical_ideal_payment_url(redirect_url)
+        if hosted_url != redirect_url:
+            log("[ideal] raw transaction URL converted to pay.ideal.nl hosted page")
         page = http.get(
-            redirect_url,
+            hosted_url,
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "User-Agent": sc.CHROME_UA,
@@ -894,7 +915,7 @@ def enrich_ideal_redirect(http, redirect_url: str, log: Callable[[str], None]) -
             timeout=45,
             allow_redirects=True,
         )
-        final_url = str(getattr(page, "url", "") or redirect_url)
+        final_url = canonical_ideal_payment_url(str(getattr(page, "url", "") or hosted_url))
         parsed = urlsplit(final_url)
         prefix = "/transactions/"
         if parsed.netloc.lower() != "pay.ideal.nl" or prefix not in parsed.path:
@@ -934,6 +955,7 @@ def enrich_ideal_redirect(http, redirect_url: str, log: Callable[[str], None]) -
         result: dict[str, Any] = {
             "provider_redirect_url": final_url,
             "ideal_qr_url": qr_url,
+            "ideal_transaction_url": qr_url,
             "qr_data": qr_url,
             "ideal_creditor_name": str(payload.get("creditorName") or ""),
             "ideal_amount": payload.get("amount"),
@@ -951,10 +973,34 @@ def enrich_ideal_redirect(http, redirect_url: str, log: Callable[[str], None]) -
         if qr_url:
             try:
                 import qrcode
-                image = qrcode.make(qr_url)
+                from qrcode.constants import ERROR_CORRECT_L
+                image = qrcode.QRCode(
+                    version=None,
+                    error_correction=ERROR_CORRECT_L,
+                    box_size=10,
+                    border=4,
+                )
+                image.add_data(qr_url)
+                image.make(fit=True)
+                image = image.make_image(fill_color="black", back_color="white")
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG")
                 result["qr_image_png"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+                try:
+                    import qrcode.image.svg
+                    svg_qr = qrcode.QRCode(
+                        version=None,
+                        error_correction=ERROR_CORRECT_L,
+                        box_size=10,
+                        border=4,
+                    )
+                    svg_qr.add_data(qr_url)
+                    svg_qr.make(fit=True)
+                    svg_buffer = io.BytesIO()
+                    svg_qr.make_image(image_factory=qrcode.image.svg.SvgPathImage).save(svg_buffer)
+                    result["qr_image_svg"] = "data:image/svg+xml;base64," + base64.b64encode(svg_buffer.getvalue()).decode("ascii")
+                except Exception:
+                    pass
             except Exception as exc:
                 log(f"[ideal] 二维码图片生成提示：{type(exc).__name__}")
             log(f"[ideal] 二维码已提取，银行入口 {len(result['ideal_supported_issuers'])} 个")
@@ -963,7 +1009,7 @@ def enrich_ideal_redirect(http, redirect_url: str, log: Callable[[str], None]) -
         return result
     except Exception as exc:
         log(f"[ideal] 二维码提取提示：{type(exc).__name__}: {str(exc)[:180]}")
-        return {"provider_redirect_url": redirect_url}
+        return {"provider_redirect_url": canonical_ideal_payment_url(redirect_url)}
 
 
 def extract_provider_result(data: dict, provider: str) -> dict[str, Any]:

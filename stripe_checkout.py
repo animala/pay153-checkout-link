@@ -175,6 +175,48 @@ def _extract_payment_method_types(payload: dict) -> list[str]:
     return ["card"]
 
 
+def _paypal_setup_diagnostic(payload: dict) -> dict:
+    """Return a compact, secret-free summary of PayPal setup/mandate fields."""
+    if not isinstance(payload, dict):
+        return {}
+
+    summary: dict[str, Any] = {}
+    for key in (
+        "mode",
+        "setup_future_usage",
+        "setup_future_usage_for_payment_method_type",
+        "payment_method_options",
+        "subscription_data",
+        "deferred_intent",
+    ):
+        value = payload.get(key)
+        if value not in (None, {}, []):
+            if isinstance(value, dict):
+                summary[key] = {str(k): type(v).__name__ for k, v in value.items()}
+            else:
+                summary[key] = value
+
+    specs = payload.get("payment_method_specs") or []
+    if isinstance(specs, list):
+        for spec in specs:
+            if not isinstance(spec, dict) or str(spec.get("type") or "").lower() != "paypal":
+                continue
+            summary["paypal_spec_keys"] = sorted(str(k) for k in spec.keys())
+            for key in (
+                "setup_future_usage",
+                "payment_method_options",
+                "mandate_options",
+                "requirements",
+            ):
+                value = spec.get(key)
+                if value not in (None, {}, []):
+                    summary[f"paypal_{key}"] = (
+                        sorted(str(k) for k in value.keys()) if isinstance(value, dict) else value
+                    )
+            break
+    return summary
+
+
 def build_http(proxy: Optional[str]):
     """curl_cffi Session（chrome136 TLS 指纹），跟随支付代理。"""
     from curl_cffi.requests import Session as CffiSession
@@ -460,6 +502,13 @@ def fetch_elements_session(http, pk: str, session_id: str, ctx: dict, version: s
     types = [s["type"] for s in data.get("payment_method_specs", []) if isinstance(s, dict) and s.get("type")]
     if types:
         ctx["payment_method_types"] = types
+    diagnostic = _paypal_setup_diagnostic(data)
+    ctx["paypal_elements_diagnostic"] = diagnostic
+    if "paypal" in types or "paypal" in pmt:
+        log(
+            "[stripe] PayPal Elements setup diagnostic: "
+            + json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))[:1600]
+        )
     return data
 
 
@@ -949,6 +998,12 @@ def poll_redirect_after_approve(http, pk: str, session_id: str, log, *, ctx: dic
         payment_intent = gj.get("payment_intent") or {}
         setup_intent = gj.get("setup_intent") or {}
         decline = payment_intent.get("last_payment_error") or setup_intent.get("last_setup_error") or {}
+        if i == 0:
+            diagnostic = _paypal_setup_diagnostic(gj)
+            log(
+                "[stripe] PayPal post-approve setup diagnostic: "
+                + json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))[:1600]
+            )
         log(
             f"[stripe] approve 后 poll {i + 1}: sub_state={sa} "
             f"payment_status={payment_intent.get('status') or ''} "
