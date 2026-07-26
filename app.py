@@ -1287,15 +1287,7 @@ class JobStore:
                 options["checkout_currency"] = "BRL"
 
             device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
-            self.update(job_id, status="running", percent=12, text="生成 Checkout 与批准校验")
-            checkout_sentinel = asyncio.run(
-                sentinel_headers(payment_proxy, "chatgpt_checkout", device_id, did)
-            )
-            approval_sentinel = {}
-            if provider != "hosted":
-                approval_sentinel = asyncio.run(
-                    sentinel_headers(payment_proxy, "checkout_session_approval", device_id, did)
-                )
+            self.update(job_id, status="running", percent=12, text="准备 Rust Checkout 任务")
             billing_geo = payment_geo if str(payment_geo.get("country") or "").upper() == country else None
             billing = default_billing(
                 country,
@@ -1342,10 +1334,10 @@ class JobStore:
                     "promotion_proxy": entry_proxy,
                     "device_id": device_id,
                     "oai_did": did,
-                    "checkout_sentinel_token": checkout_sentinel.get("openai-sentinel-token"),
-                    "checkout_sentinel_so_token": checkout_sentinel.get("openai-sentinel-so-token"),
-                    "approval_sentinel_token": approval_sentinel.get("openai-sentinel-token"),
-                    "approval_sentinel_so_token": approval_sentinel.get("openai-sentinel-so-token"),
+                    "checkout_sentinel_token": None,
+                    "checkout_sentinel_so_token": None,
+                    "approval_sentinel_token": None,
+                    "approval_sentinel_so_token": None,
                 }],
                 "transport": str(os.getenv("PAY153_RUST_TRANSPORT") or "curl_cffi"),
             }
