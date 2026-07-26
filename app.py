@@ -25,11 +25,26 @@ import stripe_checkout as sc
 from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 from upi_go_runner import available as upi_go_available, run_upi as run_upi_go
+from grok_trial import (
+    account_credentials as grok_account_credentials,
+    complete_braintree_paypal_approval as grok_complete_braintree_paypal_approval,
+    create_braintree_agreement_link as grok_create_braintree_agreement_link,
+    create_braintree_session as grok_create_braintree_session,
+    generate_trial_link,
+    pool_summary as grok_pool_summary,
+    register_braintree_agreement as grok_register_braintree_agreement,
+    resolve_braintree_agreement as grok_resolve_braintree_agreement,
+    subscribe_via_braintree as grok_subscribe_via_braintree,
+    verify_subscription as grok_verify_subscription,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
 LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
+UPI_ENABLED = str(os.getenv("PAY153_UPI_ENABLED", "0")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.config["JSON_AS_ASCII"] = False
 
@@ -439,6 +454,50 @@ def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: 
 
 
 def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_id: str, did: str, log) -> dict:
+    rust_base = str(os.getenv("PAY153_RUST_URL") or "").strip().rstrip("/")
+    if rust_base:
+        try:
+            rust_response = requests.post(
+                f"{rust_base}/api/v1/offers/check",
+                json={
+                    "access_token": token,
+                    "account_id": account_id,
+                    "proxy": proxy,
+                    "transport": str(os.getenv("PAY153_RUST_TRANSPORT") or "curl_cffi"),
+                },
+                timeout=50,
+            )
+            if rust_response.status_code == 200:
+                rust_data = rust_response.json() or {}
+                offer = rust_data.get("offer") or {}
+                campaign_id = str(offer.get("campaign_id") or "").strip()
+                normalized = {
+                    "promotion_source": "pay153_rust",
+                    "promotion_http_status": 200,
+                    "one_click_trial_eligible": bool(offer.get("eligible")),
+                    "promo_campaign_id": campaign_id,
+                    "promotion_label": str(offer.get("label") or ""),
+                    "promotion_title": str(offer.get("title") or ""),
+                    "promotion_discount_percentage": offer.get("discount_percentage"),
+                    "promotion_duration_months": (
+                        offer.get("duration_periods")
+                        if offer.get("duration_unit") == "month"
+                        else None
+                    ),
+                    "promotion_duration_period": str(offer.get("duration_unit") or ""),
+                    "promotion_processor": str(offer.get("processor") or ""),
+                    "promotion_transport": str(offer.get("transport") or ""),
+                }
+                log(
+                    f"Rust \u4f18\u60e0\u68c0\u6d4b\u5b8c\u6210\uff1a"
+                    f"{campaign_id or '\u5f53\u524d\u65e0\u4f18\u60e0'}\uff08{normalized['promotion_transport']}\uff09"
+                )
+                return normalized
+            log(f"Rust \u4f18\u60e0\u68c0\u6d4b HTTP {rust_response.status_code}\uff0c\u56de\u9000 Python")
+        except Exception as rust_exc:
+            log(f"Rust \u4f18\u60e0\u68c0\u6d4b\u5f02\u5e38\uff1a{type(rust_exc).__name__}\uff0c\u56de\u9000 Python")
+
+    """Read the account campaign catalog instead of the stale payment-method marker."""
     if not account_id:
         return {}
     http = sc.build_http(proxy)
@@ -448,34 +507,57 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
         pass
     headers = {
         "Authorization": f"Bearer {token}",
-        "Accept": "*/*",
+        "Accept": "application/json",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
-        "User-Agent": sc.CHROME_UA,
         "OAI-Language": "zh-CN",
         "OAI-Device-Id": device_id,
+        "ChatGPT-Account-ID": account_id,
     }
     try:
         resp = http.get(
-            "https://chatgpt.com/backend-api/payments/payment_methods",
-            params={"account_id": account_id},
+            "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
             headers=headers,
             timeout=35,
         )
         if resp.status_code != 200:
-            log(f"优惠预检返回 HTTP {resp.status_code}")
-            return {}
+            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u8fd4\u56de HTTP {resp.status_code}")
+            return {"promotion_source": "accounts_check", "promotion_http_status": resp.status_code}
         data = resp.json() or {}
-        log(
-            "入口支付标记 one_click_trial_eligible={}（仅为 payment_methods 字段，不作为活动资格判定）".format(
-                data.get("one_click_trial_eligible")
-            )
-        )
-        return data
+        accounts = data.get("accounts") or {}
+        account = accounts.get(account_id) or accounts.get("default") or {}
+        campaigns = account.get("eligible_promo_campaigns") or {}
+        plus = campaigns.get("plus") or {}
+        metadata = plus.get("metadata") or {}
+        discount_data = metadata.get("discount") or {}
+        duration_data = metadata.get("duration") or {}
+        campaign_id = str(plus.get("id") or plus.get("campaign_id") or "").strip()
+        discount = discount_data.get("percentage")
+        duration = duration_data.get("num_periods")
+        duration_period = duration_data.get("period") or ""
+        label = metadata.get("promotion_type_label") or metadata.get("title") or metadata.get("summary") or ""
+        processor = metadata.get("processor") or ""
+        normalized = {
+            "promotion_source": "accounts_check",
+            "promotion_http_status": resp.status_code,
+            "one_click_trial_eligible": bool(campaign_id),
+            "promo_campaign_id": campaign_id,
+            "promotion_label": label,
+            "promotion_title": metadata.get("title") or "",
+            "promotion_discount_percentage": discount,
+            "promotion_duration_months": duration if duration_period == "month" else None,
+            "promotion_duration_period": duration_period,
+            "promotion_processor": processor,
+            "eligible_offers": account.get("eligible_offers") or {},
+        }
+        if campaign_id:
+            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u5df2\u5339\u914d\uff1a{campaign_id}\uff08{label or 'Plus \u6d3b\u52a8'}\uff09")
+        else:
+            log("\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u672a\u8fd4\u56de Plus \u4f18\u60e0")
+        return normalized
     except Exception as exc:
-        log(f"优惠预检提示：{type(exc).__name__}")
+        log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u8bfb\u53d6\u5931\u8d25\uff1a{type(exc).__name__}")
         return {}
-
 
 def promo_campaign_from_payload(payload: Any) -> str:
     """Extract the account-specific campaign id returned by OpenAI.
@@ -782,8 +864,8 @@ class JobStore:
             self.condition.notify_all()
 
     def _internal_worker_done(self, _future):
-        # The private lane has its own executor and never consumes public
-        # queue/RPM slots. ThreadPoolExecutor owns its internal worker count.
+        # Private jobs use a separate executor and do not consume public
+        # queue/RPM capacity.
         with self.condition:
             self.condition.notify_all()
 
@@ -847,7 +929,7 @@ class JobStore:
                     internal=True,
                     dispatched=True,
                     queue_position=0,
-                    text="私有直通任务已提交",
+                    text="?????????",
                 )
                 future = self.internal_pool.submit(self._run, job_id, options)
                 future.add_done_callback(self._internal_worker_done)
@@ -858,7 +940,7 @@ class JobStore:
         self._append_backend_log(
             job_id,
             "SYSTEM",
-            "私有直通任务已提交到独立执行池" if internal else "任务已创建并进入队列",
+            "???????????????" if internal else "??????????",
         )
         return job_id
 
@@ -1057,7 +1139,222 @@ class JobStore:
                 self.log(job_id, "正在更换代理后重新尝试")
             time.sleep(min(4, 1 + attempt * 0.35))
 
+    def _run_rust_workflow(self, job_id: str, options: dict, rust_base: str):
+        """Prepare one existing outer retry, then execute the payment stages in Rust."""
+        try:
+            self.update(job_id, status="running", percent=6, text="解析账号与 Rust 任务参数", error="")
+            token, meta = extract_access_token(str(options.get("token_raw") or ""))
+            provider = str(options.get("link_type") or "").lower()
+            entry_proxy = str(options.get("fixed_entry_proxy") or "").strip()
+            payment_proxy = str(options.get("fixed_exit_proxy") or entry_proxy).strip()
+            if provider == "pix":
+                payment_proxy = entry_proxy
+            if not entry_proxy or not payment_proxy:
+                raise RuntimeError("Rust 工作流缺少本轮固定代理")
+
+            country = str(options.get("checkout_country") or options.get("country") or "US").upper()
+            payment_geo: dict[str, str] = {}
+            if provider == "paypal":
+                exit_pool = list(options.get("exit_proxies") or [payment_proxy])
+                payment_proxy, payment_geo, _rejected = select_paypal_exit_proxy(
+                    payment_proxy,
+                    exit_pool,
+                    scan_limit=int(os.getenv("PAYPAL_PROXY_SCAN_LIMIT", "24") or 24),
+                )
+                payment_country = str(payment_geo.get("country") or country).upper()
+                detected_currency = str(payment_geo.get("currency") or "").upper()
+                if options.get("force_paypal_de_fallback"):
+                    country, currency = "DE", "EUR"
+                else:
+                    country, currency, _source = normalize_paypal_checkout_region(
+                        payment_country, detected_currency,
+                    )
+                options["checkout_country"] = country
+                options["checkout_currency"] = currency
+                options["country"] = country
+                options["currency"] = currency
+            elif provider == "ideal":
+                country, options["currency"] = "NL", "EUR"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "EUR"
+            elif provider == "upi":
+                country, options["currency"] = "IN", "INR"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "INR"
+            elif provider == "pix":
+                country, options["currency"] = "BR", "BRL"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "BRL"
+
+            device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
+            self.update(job_id, status="running", percent=12, text="生成 Checkout 与批准校验")
+            checkout_sentinel = asyncio.run(
+                sentinel_headers(payment_proxy, "chatgpt_checkout", device_id, did)
+            )
+            approval_sentinel = asyncio.run(
+                sentinel_headers(payment_proxy, "checkout_session_approval", device_id, did)
+            )
+            billing_geo = payment_geo if str(payment_geo.get("country") or "").upper() == country else None
+            billing = default_billing(
+                country,
+                str(meta.get("email") or ""),
+                str(options.get("pix_tax_id") or ""),
+                billing_geo,
+                real_random=(provider == "paypal"),
+            )
+            if provider == "pix":
+                identity = dict(options.get("pix_identity") or {})
+                if identity:
+                    billing["name"] = identity.get("name") or billing.get("name")
+                    billing["email"] = identity.get("email") or billing.get("email")
+                    address = billing.setdefault("address", {})
+                    for key in ("line1", "city", "state", "postal_code"):
+                        if identity.get(key):
+                            address[key] = identity[key]
+            address = dict(billing.get("address") or {})
+            address.setdefault("line2", "")
+            rust_billing = {
+                "name": str(billing.get("name") or ""),
+                "email": str(billing.get("email") or ""),
+                "tax_id": str(billing.get("tax_id") or ""),
+                "address": {
+                    "country": str(address.get("country") or country),
+                    "line1": str(address.get("line1") or ""),
+                    "line2": str(address.get("line2") or ""),
+                    "city": str(address.get("city") or ""),
+                    "postal_code": str(address.get("postal_code") or ""),
+                    "state": str(address.get("state") or ""),
+                },
+            }
+            profile = sc._profile(country)
+            common = {
+                "access_token": token,
+                "account_id": str(meta.get("account_id") or ""),
+                "payload": checkout_payload(options, meta),
+                "billing": rust_billing,
+                "browser_locale": str(profile.get("browser_locale") or "en-US"),
+                "browser_timezone": str(profile.get("browser_timezone") or "America/Chicago"),
+                "attempts": [{
+                    "chatgpt_proxy": payment_proxy,
+                    "stripe_proxy": payment_proxy,
+                    "promotion_proxy": entry_proxy,
+                    "device_id": device_id,
+                    "oai_did": did,
+                    "checkout_sentinel_token": checkout_sentinel.get("openai-sentinel-token"),
+                    "checkout_sentinel_so_token": checkout_sentinel.get("openai-sentinel-so-token"),
+                    "approval_sentinel_token": approval_sentinel.get("openai-sentinel-token"),
+                    "approval_sentinel_so_token": approval_sentinel.get("openai-sentinel-so-token"),
+                }],
+                "transport": str(os.getenv("PAY153_RUST_TRANSPORT") or "curl_cffi"),
+            }
+            if options.get("use_promo") and options.get("plan") == "plus":
+                common["promo"] = {
+                    "campaign_id": str(options.get("promo_campaign") or "plus-1-month-free"),
+                    "plan_name": PLANS["plus"],
+                    "price_interval": "month",
+                    "seat_quantity": 1,
+                    "require_zero_due": True,
+                }
+            if provider == "paypal":
+                try:
+                    common["fingerprint"] = json.loads(
+                        Path(__file__).with_name("paypal_fingerprint.json").read_text(encoding="utf-8")
+                    )
+                    if "_stripe_version" in common["fingerprint"]:
+                        common["fingerprint"]["stripe_version"] = common["fingerprint"].pop("_stripe_version")
+                except Exception:
+                    common["fingerprint"] = {}
+                endpoint = "/api/v1/jobs/paypal-workflow"
+            else:
+                common["provider"] = provider
+                endpoint = "/api/v1/jobs/local-workflow"
+
+            response = requests.post(
+                f"{rust_base}{endpoint}", json=common, timeout=90,
+            )
+            if response.status_code != 202:
+                raise RuntimeError(
+                    f"Rust 工作流创建失败 HTTP {response.status_code}: {(response.text or '')[:500]}"
+                )
+            rust_job_id = str((response.json() or {}).get("job", {}).get("id") or "")
+            if not rust_job_id:
+                raise RuntimeError("Rust 工作流未返回任务 ID")
+            step_labels = {
+                "creating_checkout": "创建 OpenAI Checkout",
+                "stripe_bootstrap": "初始化 Stripe 支付方式",
+                "applying_promotion": "应用优惠并同步金额",
+                "syncing_billing": "同步账单地址",
+                "creating_paypal_payment_method": "创建 PayPal PaymentMethod",
+                "creating_local_payment_method": f"创建 {provider.upper()} PaymentMethod",
+                "confirming_paypal": "提交 PayPal confirm",
+                "confirming_local_payment": f"提交 {provider.upper()} confirm",
+                "approving_checkout": "提交 Checkout approval",
+                "polling_paypal_redirect": "读取 PayPal 跳转",
+                "polling_local_result": f"读取 {provider.upper()} 支付结果",
+                "retrying_with_fresh_checkout": "更换参数并重建 Checkout",
+            }
+            while True:
+                if self.cancelled(job_id):
+                    try:
+                        requests.post(f"{rust_base}/api/v1/jobs/{rust_job_id}/cancel", timeout=8)
+                    except Exception:
+                        pass
+                    self.update(job_id, status="cancelled", percent=100, text="任务已停止", error="任务已停止")
+                    return
+                progress_response = requests.get(
+                    f"{rust_base}/api/v1/jobs/{rust_job_id}", timeout=15,
+                )
+                if progress_response.status_code != 200:
+                    raise RuntimeError(f"Rust 任务状态 HTTP {progress_response.status_code}")
+                rust_job = (progress_response.json() or {}).get("job") or {}
+                rust_status = str(rust_job.get("status") or "")
+                rust_step = str(rust_job.get("step") or "")
+                if rust_status not in {"succeeded", "failed", "cancelled"}:
+                    self.update(
+                        job_id,
+                        status="running",
+                        percent=int(rust_job.get("progress") or 0),
+                        text=step_labels.get(rust_step, rust_step or "Rust 工作流运行中"),
+                        error=str(rust_job.get("error") or "")[:1200],
+                    )
+                if rust_status == "succeeded":
+                    result = dict(rust_job.get("result") or {})
+                    result.update({
+                        "plan": options.get("plan"),
+                        "link_type": provider,
+                        "account_email": str(meta.get("email") or ""),
+                        "account_id": str(meta.get("account_id") or ""),
+                        "country": country,
+                        "currency": str(result.get("currency") or options.get("currency") or "").upper(),
+                        "entry_country": str(proxy_country(entry_proxy)[0] or "").upper(),
+                        "payment_proxy_country": str(proxy_country(payment_proxy)[0] or "").upper(),
+                        "rust_workflow": True,
+                    })
+                    if provider == "paypal":
+                        result["paypal_link"] = result.get("paypal_url") or ""
+                        result["provider_redirect_url"] = result.get("paypal_url") or result.get("stripe_redirect_url") or ""
+                    self.update(job_id, status="done", percent=100, text="提取完成", error="", result=result)
+                    return
+                if rust_status == "failed":
+                    self.update(job_id, status="error", percent=100, text="本轮未命中", error=str(rust_job.get("error") or "Rust 工作流失败")[:1200])
+                    return
+                if rust_status == "cancelled":
+                    self.update(job_id, status="cancelled", percent=100, text="任务已停止", error="任务已停止")
+                    return
+                time.sleep(0.5)
+        except InterruptedError as exc:
+            self.update(job_id, status="cancelled", percent=100, text="任务已停止", error=str(exc))
+        except Exception as exc:
+            self.log(job_id, f"Rust 工作流异常：{type(exc).__name__}: {exc}")
+            self.update(job_id, status="error", percent=100, text="本轮未命中", error=str(exc)[:1200])
+
     def _run_single(self, job_id: str, options: dict):
+        rust_base = str(os.getenv("PAY153_RUST_URL") or "").strip().rstrip("/")
+        rust_execute = str(os.getenv("PAY153_RUST_WORKFLOWS") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if rust_execute and rust_base and options.get("link_type") in {"paypal", "pix", "upi", "ideal"}:
+            return self._run_rust_workflow(job_id, options, rust_base)
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
             token, meta = extract_access_token(options.pop("token_raw"))
@@ -1687,6 +1984,176 @@ def private_checkout_page():
     return send_from_directory(app.static_folder, "index.html")
 
 
+@app.get("/grok-trial")
+@app.get("/grok-trial/")
+def grok_trial_page():
+    # Hidden tool page: intentionally omitted from the public navigation.
+    return send_from_directory(app.static_folder, "grok-trial.html")
+
+
+@app.get("/api/grok-trial/status")
+def grok_trial_status():
+    return jsonify({"ok": True, **grok_pool_summary()})
+
+
+@app.post("/api/grok-trial/extract")
+def grok_trial_extract():
+    client_ip = request_client_ip()
+    allowed, retry_after = IP_TASK_LIMITER.acquire(client_ip)
+    if not allowed:
+        response = jsonify({
+            "ok": False,
+            "error": f"当前 IP 每分钟最多创建 {IP_TASK_LIMITER.limit} 个任务，请在 {retry_after} 秒后重试。",
+            "retry_after": retry_after,
+        })
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
+    data = request.get_json(silent=True) or {}
+    try:
+        result = generate_trial_link(
+            str(data.get("account_id") or ""),
+            str(data.get("region") or "US"),
+        )
+        supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
+        expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
+        if supplied and hmac.compare_digest(supplied, expected):
+            result["credentials"] = grok_account_credentials(result["account_id"])
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:800]}), 502
+
+
+@app.post("/api/grok-trial/verify")
+def grok_trial_verify():
+    data = request.get_json(silent=True) or {}
+    account_id = str(data.get("account_id") or "").strip()
+    if not account_id:
+        return jsonify({"ok": False, "error": "缺少 Grok 账号 ID"}), 400
+    try:
+        result = grok_verify_subscription(
+            account_id,
+            str(data.get("region") or "US"),
+            hard_sync=True,
+        )
+        supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
+        expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
+        if supplied and hmac.compare_digest(supplied, expected):
+            result["credentials"] = grok_account_credentials(account_id)
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:800]}), 502
+
+
+@app.post("/api/grok-trial/braintree-session")
+def grok_trial_braintree_session():
+    data = request.get_json(silent=True) or {}
+    supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
+    expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        return jsonify({"ok": False, "error": "Braintree 私有功能令牌校验失败"}), 403
+    try:
+        result = grok_create_braintree_session(
+            str(data.get("account_id") or "").strip(),
+            str(data.get("region") or "US"),
+        )
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:800]}), 400
+
+
+@app.post("/api/grok-trial/braintree-link")
+def grok_trial_braintree_link():
+    data = request.get_json(silent=True) or {}
+    account_id = str(data.get("account_id") or "").strip()
+    proxy_override = str(data.get("proxy") or "").strip()
+    supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
+    expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        return jsonify({"ok": False, "error": "Braintree 私有功能令牌校验失败"}), 403
+    if not proxy_override:
+        return jsonify({"ok": False, "error": "请填写与账单国家一致的协议生成代理"}), 400
+    try:
+        result = grok_create_braintree_agreement_link(
+            account_id=account_id,
+            region=str(data.get("region") or "US"),
+            proxy_override=proxy_override,
+        )
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:1000]}), 400
+
+
+@app.post("/api/grok-trial/braintree-subscribe")
+def grok_trial_braintree_subscribe():
+    data = request.get_json(silent=True) or {}
+    supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
+    expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        return jsonify({"ok": False, "error": "Braintree 私有功能令牌校验失败"}), 403
+    account_id = str(data.get("account_id") or "").strip()
+    nonce = str(data.get("nonce") or "").strip()
+    if not account_id or not nonce:
+        return jsonify({"ok": False, "error": "缺少 Grok 账号或 Braintree nonce"}), 400
+    try:
+        result = grok_subscribe_via_braintree(
+            account_id=account_id,
+            nonce=nonce,
+            region=str(data.get("region") or "US"),
+            plan_id=str(data.get("plan_id") or "supergrok_monthly"),
+            campaign_id=str(data.get("campaign_id") or ""),
+        )
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        app.logger.warning("Braintree card subscription failed: %s", str(exc)[:1000])
+        return jsonify({"ok": False, "error": str(exc)[:1000]}), 422
+
+
+@app.post("/api/grok-trial/braintree-complete")
+def grok_trial_braintree_complete():
+    data = request.get_json(silent=True) or {}
+    account_id = str(data.get("account_id") or "").strip()
+    billing_token = str(data.get("billing_token") or "").strip()
+    payer_id = str(data.get("payer_id") or "").strip()
+    if not account_id or not billing_token or not payer_id:
+        return jsonify({"ok": False, "error": "缺少 Grok 账号、Billing Token 或 Payer ID"}), 400
+    try:
+        result = grok_complete_braintree_paypal_approval(
+            account_id=account_id,
+            billing_token=billing_token,
+            payer_id=payer_id,
+            region=str(data.get("region") or "US"),
+            plan_id=str(data.get("plan_id") or "supergrok_monthly"),
+            campaign_id=str(data.get("campaign_id") or ""),
+            proxy_override=str(data.get("proxy") or ""),
+        )
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:1200]}), 502
+
+
+@app.post("/api/grok-trial/braintree-register")
+def grok_trial_braintree_register():
+    data = request.get_json(silent=True) or {}
+    try:
+        result = grok_register_braintree_agreement(
+            account_id=str(data.get("account_id") or ""),
+            billing_token=str(data.get("billing_token") or ""),
+            region=str(data.get("region") or "US"),
+            plan_id=str(data.get("plan_id") or "supergrok_monthly"),
+            campaign_id=str(data.get("campaign_id") or ""),
+        )
+        return jsonify({"ok": True, "result": result})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:800]}), 400
+
+
+@app.post("/api/grok-trial/braintree-context")
+def grok_trial_braintree_context():
+    data = request.get_json(silent=True) or {}
+    result = grok_resolve_braintree_agreement(str(data.get("billing_token") or ""))
+    return jsonify({"ok": True, "result": result})
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "pay153", "time": int(time.time())})
@@ -1696,7 +2163,9 @@ def health():
 def config():
     return jsonify({
         "plans": list(PLANS),
-        "link_types": ["hosted", "paypal", "ideal", "upi", "pix"],
+        "link_types": ["hosted", "paypal", "ideal", "pix"]
+            + (["upi"] if UPI_ENABLED else []),
+        "disabled_link_types": [] if UPI_ENABLED else ["upi"],
         "country_currency": COUNTRY_CURRENCY,
         "provider_defaults": PROVIDER_DEFAULTS,
         "proxy_policy": {
@@ -1730,6 +2199,8 @@ def start_checkout():
         return jsonify({"error": "计划类型不正确"}), 400
     if link_type not in {"hosted", "paypal", "ideal", "upi", "pix"}:
         return jsonify({"error": "提取方式不正确"}), 400
+    if link_type == "upi" and not UPI_ENABLED:
+        return jsonify({"error": "UPI 提链已暂停维护"}), 503
     defaults = PROVIDER_DEFAULTS.get(link_type, {})
     country = str(data.get("country") or defaults.get("country") or "US").upper()
     requested_currency = str(data.get("currency") or defaults.get("currency") or COUNTRY_CURRENCY.get(country, "USD")).upper()
