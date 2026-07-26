@@ -21,9 +21,9 @@ const PROXY_STORAGE_KEYS = {
 const providerDefaults = {
   hosted: {country: 'US', currency: 'USD'}, paypal: {country: 'US', currency: 'USD'},
   ideal: {country: 'NL', currency: 'EUR'}, upi: {country: 'IN', currency: 'INR'},
-  pix: {country: 'BR', currency: 'BRL'}
+  pix: {country: 'BR', currency: 'BRL'}, kakao: {country: 'KR', currency: 'KRW'}
 };
-const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',GB:'GBP',JP:'JPY',AU:'AUD',CA:'CAD'};
+const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',GB:'GBP',JP:'JPY',KR:'KRW',AU:'AUD',CA:'CAD'};
 
 function proxyLines(node){
   return node.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
@@ -98,9 +98,10 @@ function syncFields(applyRailDefault=false){
     paypal: '\u63a8\u8350\u4ee3\u7406\uff1a\u7cfb\u7edf\u4f18\u5148\u4f7f\u7528\u4ee3\u7406\u6c60 2 \u5f53\u524d\u56fd\u5bb6\u7684 PayPal \u8d26\u5355\uff1b\u82e5\u8be5\u56fd\u5bb6 Checkout \u672a\u5f00\u653e PayPal\uff0c\u5219\u81ea\u52a8\u56de\u9000\u5fb7\u56fd DE/EUR \u8d26\u5355\u3002',
     ideal: '推荐代理：两个代理池均使用 NL。',
     upi: '推荐代理：代理池 1 使用可获得优惠资格的国家或地区（如 TR、JP、BR），代理池 2 使用 IN 创建并处理 UPI。',
-    pix: '推荐代理：代理池 1 使用 BR。'
+    pix: '推荐代理：代理池 1 使用 BR。',
+    kakao: '推荐代理：代理池 1 使用 VN 应用优惠，代理池 2 使用 KR 创建并处理 Kakao Pay。'
   };
-  const pool2Hints = {paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN'};
+  const pool2Hints = {paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN',kakao:'推荐 KR'};
   const recommendation = recommendations[rail] || '推荐代理：使用与所选地区一致的代理。';
   $('proxyRecommendation').textContent = recommendation;
   $('proxyFootHint').textContent = recommendation;
@@ -203,8 +204,10 @@ function showResult(result){
   $('resultRegion').textContent = `${result.country || '—'} / ${result.currency || '—'}`;
   $('resultPromo').textContent = !result.promo_requested ? '未请求' : result.promo_applied === true ? '已生效 · 今日应付 0' : result.promo_applied === false ? '未生效' : '打开结账页确认';
   $('resultSession').textContent = result.checkout_session_id || '—';
-  const isIdeal = String(result.link_type || result.provider || '').toLowerCase() === 'ideal';
-  const finalValue = isIdeal
+  const resultProvider = String(result.link_type || result.provider || '').toLowerCase();
+  const isIdeal = resultProvider === 'ideal';
+  const isKakao = resultProvider === 'kakao';
+  const finalValue = (isIdeal || isKakao)
     ? (result.provider_redirect_url || result.checkout_url || result.qr_data || '')
     : (result.qr_data || result.provider_redirect_url || result.checkout_url || '');
   $('resultValue').value = finalValue;

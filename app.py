@@ -1284,6 +1284,10 @@ class JobStore:
                 country, options["currency"] = "BR", "BRL"
                 options["country"] = options["checkout_country"] = country
                 options["checkout_currency"] = "BRL"
+            elif provider == "kakao":
+                country, options["currency"] = "KR", "KRW"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "KRW"
 
             prepare_response = requests.post(
                 f"{rust_base}/api/v1/legacy/prepare",
@@ -1383,6 +1387,7 @@ class JobStore:
                     "price_interval": "month",
                     "seat_quantity": 1,
                     "require_zero_due": True,
+                    "always_update": provider == "kakao",
                 }
             if provider == "paypal":
                 try:
@@ -1423,6 +1428,10 @@ class JobStore:
                 "syncing_billing": "同步账单地址",
                 "creating_paypal_payment_method": "创建 PayPal PaymentMethod",
                 "creating_local_payment_method": f"创建 {provider.upper()} PaymentMethod",
+                "preconfirming_kakao": "准备 Kakao Pay 支付会话",
+                "creating_kakao_payment_method": "创建 Kakao Pay PaymentMethod",
+                "confirming_kakao": "提交 Kakao Pay confirm",
+                "polling_kakao_redirect": "读取 Kakao / Nicepay 跳转",
                 "confirming_paypal": "提交 PayPal confirm",
                 "confirming_local_payment": f"提交 {provider.upper()} confirm",
                 "approving_checkout": "提交 Checkout approval",
@@ -1490,7 +1499,7 @@ class JobStore:
         rust_execute = str(os.getenv("PAY153_RUST_WORKFLOWS") or "").strip().lower() in {
             "1", "true", "yes", "on",
         }
-        if rust_execute and rust_base and options.get("link_type") in {"hosted", "paypal", "pix", "upi", "ideal"}:
+        if rust_execute and rust_base and options.get("link_type") in {"hosted", "paypal", "pix", "upi", "ideal", "kakao"}:
             return self._run_rust_workflow(job_id, options, rust_base)
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
@@ -2300,14 +2309,14 @@ def health():
 def config():
     return jsonify({
         "plans": list(PLANS),
-        "link_types": ["hosted", "paypal", "ideal", "pix"]
+        "link_types": ["hosted", "paypal", "ideal", "pix", "kakao"]
             + (["upi"] if UPI_ENABLED else []),
         "disabled_link_types": [] if UPI_ENABLED else ["upi"],
         "country_currency": COUNTRY_CURRENCY,
         "provider_defaults": PROVIDER_DEFAULTS,
         "proxy_policy": {
             "entry_required": True,
-            "exit_required_for": ["paypal", "ideal", "upi"],
+            "exit_required_for": ["paypal", "ideal", "upi", "kakao"],
             "single_chain_for": ["pix"],
             "max_per_pool": 500,
             "selection": "random_per_job",
@@ -2334,7 +2343,7 @@ def start_checkout():
     link_type = str(data.get("link_type") or "hosted").lower()
     if plan not in PLANS:
         return jsonify({"error": "计划类型不正确"}), 400
-    if link_type not in {"hosted", "paypal", "ideal", "upi", "pix"}:
+    if link_type not in {"hosted", "paypal", "ideal", "upi", "pix", "kakao"}:
         return jsonify({"error": "提取方式不正确"}), 400
     if link_type == "upi" and not UPI_ENABLED:
         return jsonify({"error": "UPI 提链已暂停维护"}), 503

@@ -20,6 +20,7 @@ PROVIDER_DEFAULTS = {
     "ideal": {"country": "NL", "currency": "EUR"},
     "upi": {"country": "IN", "currency": "INR"},
     "pix": {"country": "BR", "currency": "BRL"},
+    "kakao": {"country": "KR", "currency": "KRW"},
 }
 
 # PIX Automático / UPI AutoPay mandate_options were added after the Checkout
