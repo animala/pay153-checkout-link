@@ -41,12 +41,97 @@ from grok_trial import (
 
 ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
+RUST_ALIAS_FILE = ROOT / "data" / "rust_job_aliases.json"
+RUST_ALIAS_LOCK = threading.RLock()
 LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
 UPI_ENABLED = str(os.getenv("PAY153_UPI_ENABLED", "0")).strip().lower() in {
     "1", "true", "yes", "on",
 }
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.config["JSON_AS_ASCII"] = False
+
+
+def remember_rust_job_alias(public_job_id: str, rust_job_id: str, metadata: dict[str, Any]) -> None:
+    now = time.time()
+    with RUST_ALIAS_LOCK:
+        try:
+            rows = json.loads(RUST_ALIAS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(rows, dict):
+                rows = {}
+        except Exception:
+            rows = {}
+        rows = {
+            str(key): value for key, value in rows.items()
+            if isinstance(value, dict) and now - float(value.get("created_at") or now) < 86400
+        }
+        rows[str(public_job_id)] = {
+            "rust_job_id": str(rust_job_id),
+            "created_at": now,
+            **{str(key): value for key, value in metadata.items() if key in {
+                "plan", "link_type", "country", "currency",
+            }},
+        }
+        RUST_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = RUST_ALIAS_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(RUST_ALIAS_FILE)
+
+
+def get_rust_job_alias(public_job_id: str) -> dict[str, Any] | None:
+    with RUST_ALIAS_LOCK:
+        try:
+            rows = json.loads(RUST_ALIAS_FILE.read_text(encoding="utf-8"))
+            value = rows.get(str(public_job_id)) if isinstance(rows, dict) else None
+            return dict(value) if isinstance(value, dict) else None
+        except Exception:
+            return None
+
+
+def rust_job_public_snapshot(public_job_id: str) -> dict[str, Any] | None:
+    alias = get_rust_job_alias(public_job_id)
+    rust_base = str(os.getenv("PAY153_RUST_URL") or "").strip().rstrip("/")
+    if not alias or not rust_base:
+        return None
+    rust_job_id = str(alias.get("rust_job_id") or "")
+    if not rust_job_id:
+        return None
+    try:
+        response = requests.get(f"{rust_base}/api/v1/jobs/{rust_job_id}", timeout=12)
+        if response.status_code != 200:
+            return None
+        job = (response.json() or {}).get("job") or {}
+    except Exception:
+        return None
+    status_map = {
+        "queued": "queued",
+        "running": "running",
+        "succeeded": "done",
+        "failed": "error",
+        "cancelled": "cancelled",
+    }
+    result = dict(job.get("result") or {})
+    result.update({
+        "plan": alias.get("plan") or result.get("plan"),
+        "link_type": alias.get("link_type") or result.get("link_type"),
+        "country": alias.get("country") or result.get("country"),
+        "currency": str(result.get("currency") or alias.get("currency") or "").upper(),
+        "rust_workflow": True,
+    })
+    if result.get("link_type") == "paypal":
+        result["paypal_link"] = result.get("paypal_url") or result.get("paypal_link") or ""
+        result["provider_redirect_url"] = result.get("paypal_link") or result.get("stripe_redirect_url") or ""
+    return {
+        "id": public_job_id,
+        "status": status_map.get(str(job.get("status") or ""), "running"),
+        "percent": int(job.get("progress") or 0),
+        "text": str(job.get("step") or "Rust 工作流运行中"),
+        "logs": [],
+        "result": result if job.get("status") == "succeeded" else None,
+        "error": str(job.get("error") or ""),
+        "queue_position": 0,
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
 
 STRIPE_CHECKOUT_FRAGMENT = (
     "#fidnandhYHdWcXxpYCc%2FJ2FgY2RwaXEnKSdpamZkaWAnPyd%2FbScpJ3ZwZ3Zmd2x1cWxqa1Brb"
@@ -1283,6 +1368,12 @@ class JobStore:
             rust_job_id = str((response.json() or {}).get("job", {}).get("id") or "")
             if not rust_job_id:
                 raise RuntimeError("Rust 工作流未返回任务 ID")
+            remember_rust_job_alias(job_id, rust_job_id, {
+                "plan": options.get("plan"),
+                "link_type": provider,
+                "country": country,
+                "currency": options.get("currency"),
+            })
             step_labels = {
                 "creating_checkout": "创建 OpenAI Checkout",
                 "stripe_bootstrap": "初始化 Stripe 支付方式",
@@ -2304,7 +2395,10 @@ def start_checkout():
 
 @app.get("/api/checkout-progress")
 def checkout_progress():
-    job = STORE.get(str(request.args.get("job_id") or ""), public=True)
+    job_id = str(request.args.get("job_id") or "")
+    job = STORE.get(job_id, public=True)
+    if not job:
+        job = rust_job_public_snapshot(job_id)
     if not job:
         if LEGACY_SERVICE_BASE:
             try:
@@ -2329,6 +2423,19 @@ def checkout_cancel():
     data = request.get_json(silent=True) or {}
     job_id = str(data.get("job_id") or "")
     ok = STORE.cancel(job_id)
+    if not ok:
+        alias = get_rust_job_alias(job_id)
+        rust_base = str(os.getenv("PAY153_RUST_URL") or "").strip().rstrip("/")
+        rust_job_id = str((alias or {}).get("rust_job_id") or "")
+        if rust_base and rust_job_id:
+            try:
+                response = requests.post(
+                    f"{rust_base}/api/v1/jobs/{rust_job_id}/cancel",
+                    timeout=8,
+                )
+                ok = response.status_code in {200, 202}
+            except Exception:
+                ok = False
     if not ok and LEGACY_SERVICE_BASE:
         try:
             legacy = requests.post(
