@@ -1191,9 +1191,11 @@ class JobStore:
             checkout_sentinel = asyncio.run(
                 sentinel_headers(payment_proxy, "chatgpt_checkout", device_id, did)
             )
-            approval_sentinel = asyncio.run(
-                sentinel_headers(payment_proxy, "checkout_session_approval", device_id, did)
-            )
+            approval_sentinel = {}
+            if provider != "hosted":
+                approval_sentinel = asyncio.run(
+                    sentinel_headers(payment_proxy, "checkout_session_approval", device_id, did)
+                )
             billing_geo = payment_geo if str(payment_geo.get("country") or "").upper() == country else None
             billing = default_billing(
                 country,
@@ -1265,6 +1267,8 @@ class JobStore:
                 except Exception:
                     common["fingerprint"] = {}
                 endpoint = "/api/v1/jobs/paypal-workflow"
+            elif provider == "hosted":
+                endpoint = "/api/v1/jobs/hosted-workflow"
             else:
                 common["provider"] = provider
                 endpoint = "/api/v1/jobs/local-workflow"
@@ -1353,7 +1357,7 @@ class JobStore:
         rust_execute = str(os.getenv("PAY153_RUST_WORKFLOWS") or "").strip().lower() in {
             "1", "true", "yes", "on",
         }
-        if rust_execute and rust_base and options.get("link_type") in {"paypal", "pix", "upi", "ideal"}:
+        if rust_execute and rust_base and options.get("link_type") in {"hosted", "paypal", "pix", "upi", "ideal"}:
             return self._run_rust_workflow(job_id, options, rust_base)
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
