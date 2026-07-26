@@ -1228,7 +1228,6 @@ class JobStore:
         """Prepare one existing outer retry, then execute the payment stages in Rust."""
         try:
             self.update(job_id, status="running", percent=6, text="解析账号与 Rust 任务参数", error="")
-            token, meta = extract_access_token(str(options.get("token_raw") or ""))
             provider = str(options.get("link_type") or "").lower()
             entry_proxy = str(options.get("fixed_entry_proxy") or "").strip()
             payment_proxy = str(options.get("fixed_exit_proxy") or entry_proxy).strip()
@@ -1286,6 +1285,30 @@ class JobStore:
                 options["country"] = options["checkout_country"] = country
                 options["checkout_currency"] = "BRL"
 
+            prepare_response = requests.post(
+                f"{rust_base}/api/v1/legacy/prepare",
+                json={
+                    "token_raw": str(options.get("token_raw") or ""),
+                    "options": options,
+                },
+                timeout=20,
+            )
+            if prepare_response.status_code != 200:
+                raise RuntimeError(
+                    f"Rust 参数准备失败 HTTP {prepare_response.status_code}: "
+                    f"{(prepare_response.text or '')[:500]}"
+                )
+            prepared = dict((prepare_response.json() or {}).get("prepared") or {})
+            token = str(prepared.get("access_token") or "")
+            meta = dict(prepared.get("meta") or {})
+            prepared_payload = prepared.get("payload") or {}
+            country = str(prepared.get("country") or country).upper()
+            options["currency"] = options["checkout_currency"] = str(
+                prepared.get("currency") or options.get("currency") or ""
+            ).upper()
+            if not token or not meta.get("account_id") or not prepared_payload:
+                raise RuntimeError("Rust 参数准备结果不完整")
+
             device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
             self.update(job_id, status="running", percent=12, text="准备 Rust Checkout 任务")
             billing_geo = payment_geo if str(payment_geo.get("country") or "").upper() == country else None
@@ -1336,7 +1359,7 @@ class JobStore:
             common = {
                 "access_token": token,
                 "account_id": str(meta.get("account_id") or ""),
-                "payload": checkout_payload(options, meta),
+                "payload": prepared_payload,
                 "billing": rust_billing,
                 "browser_locale": str(profile.get("browser_locale") or "en-US"),
                 "browser_timezone": str(profile.get("browser_timezone") or "America/Chicago"),
