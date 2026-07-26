@@ -1482,7 +1482,17 @@ class JobStore:
                     self.update(job_id, status="done", percent=100, text="提取完成", error="", result=result)
                     return
                 if rust_status == "failed":
-                    self.update(job_id, status="error", percent=100, text="本轮未命中", error=str(rust_job.get("error") or "Rust 工作流失败")[:1200])
+                    rust_error = str(rust_job.get("error") or "Rust 工作流失败")[:1200]
+                    if options.get("retry_wrapper"):
+                        self.update(
+                            job_id,
+                            status="running",
+                            percent=8,
+                            text="本轮未成功，正在更换代理重试",
+                            error=rust_error,
+                        )
+                    else:
+                        self.update(job_id, status="error", percent=100, text="任务失败", error=rust_error)
                     return
                 if rust_status == "cancelled":
                     self.update(job_id, status="cancelled", percent=100, text="任务已停止", error="任务已停止")
@@ -1492,7 +1502,16 @@ class JobStore:
             self.update(job_id, status="cancelled", percent=100, text="任务已停止", error=str(exc))
         except Exception as exc:
             self.log(job_id, f"Rust 工作流异常：{type(exc).__name__}: {exc}")
-            self.update(job_id, status="error", percent=100, text="本轮未命中", error=str(exc)[:1200])
+            if options.get("retry_wrapper"):
+                self.update(
+                    job_id,
+                    status="running",
+                    percent=8,
+                    text="本轮未成功，正在更换代理重试",
+                    error=str(exc)[:1200],
+                )
+            else:
+                self.update(job_id, status="error", percent=100, text="任务失败", error=str(exc)[:1200])
 
     def _run_single(self, job_id: str, options: dict):
         rust_base = str(os.getenv("PAY153_RUST_URL") or "").strip().rstrip("/")
