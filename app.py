@@ -1241,11 +1241,26 @@ class JobStore:
             payment_geo: dict[str, str] = {}
             if provider == "paypal":
                 exit_pool = list(options.get("exit_proxies") or [payment_proxy])
-                payment_proxy, payment_geo, _rejected = select_paypal_exit_proxy(
-                    payment_proxy,
-                    exit_pool,
-                    scan_limit=int(os.getenv("PAYPAL_PROXY_SCAN_LIMIT", "24") or 24),
+                proxy_response = requests.post(
+                    f"{rust_base}/api/v1/proxies/select",
+                    json={
+                        "proxies": exit_pool,
+                        "preferred": payment_proxy,
+                        "scan_limit": int(os.getenv("PAYPAL_PROXY_SCAN_LIMIT", "24") or 24),
+                        "transport": str(os.getenv("PAY153_RUST_TRANSPORT") or "curl_cffi"),
+                    },
+                    timeout=90,
                 )
+                if proxy_response.status_code != 200:
+                    raise RuntimeError(
+                        f"Rust 代理选择失败 HTTP {proxy_response.status_code}: "
+                        f"{(proxy_response.text or '')[:500]}"
+                    )
+                proxy_selection = proxy_response.json() or {}
+                payment_proxy = str(proxy_selection.get("selected") or "").strip()
+                payment_geo = dict(proxy_selection.get("geo") or {})
+                if not payment_proxy or not payment_geo.get("country"):
+                    raise RuntimeError("Rust 代理选择未返回有效代理地区")
                 payment_country = str(payment_geo.get("country") or country).upper()
                 detected_currency = str(payment_geo.get("currency") or "").upper()
                 if options.get("force_paypal_de_fallback"):
