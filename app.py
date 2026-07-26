@@ -1289,13 +1289,25 @@ class JobStore:
             device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
             self.update(job_id, status="running", percent=12, text="准备 Rust Checkout 任务")
             billing_geo = payment_geo if str(payment_geo.get("country") or "").upper() == country else None
-            billing = default_billing(
-                country,
-                str(meta.get("email") or ""),
-                str(options.get("pix_tax_id") or ""),
-                billing_geo,
-                real_random=(provider == "paypal"),
+            billing_response = requests.post(
+                f"{rust_base}/api/v1/billing/generate",
+                json={
+                    "country": country,
+                    "email": str(meta.get("email") or ""),
+                    "tax_id": str(options.get("pix_tax_id") or ""),
+                    "geo": billing_geo,
+                    "rotate_public_address": provider == "paypal",
+                },
+                timeout=20,
             )
+            if billing_response.status_code != 200:
+                raise RuntimeError(
+                    f"Rust 账单生成失败 HTTP {billing_response.status_code}: "
+                    f"{(billing_response.text or '')[:500]}"
+                )
+            billing = dict(((billing_response.json() or {}).get("profile") or {}).get("billing") or {})
+            if not billing.get("address"):
+                raise RuntimeError("Rust 账单生成未返回地址")
             if provider == "pix":
                 identity = dict(options.get("pix_identity") or {})
                 if identity:
