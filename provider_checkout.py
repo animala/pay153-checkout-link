@@ -20,7 +20,9 @@ PROVIDER_DEFAULTS = {
     "ideal": {"country": "NL", "currency": "EUR"},
     "upi": {"country": "IN", "currency": "INR"},
     "pix": {"country": "BR", "currency": "BRL"},
-    "kakao": {"country": "KR", "currency": "KRW"},
+    "momo": {"country": "VN", "currency": "VND"},
+    "gcash": {"country": "PH", "currency": "PHP"},
+    "twint": {"country": "CH", "currency": "CHF"},
 }
 
 # PIX Automático / UPI AutoPay mandate_options were added after the Checkout
@@ -296,13 +298,16 @@ def default_billing(country: str, email: str = "", tax_id: str = "", geo: dict[s
         "NL": ("Lars de Vries", "Damrak 1", "Amsterdam", "1012LG", "NH"),
         "IN": ("Arjun Sharma", "1 MG Road", "Bengaluru", "560001", "KA"),
         "BR": ("Lucas Silva", "Avenida Paulista 1000", "Sao Paulo", "01310-100", "SP"),
+        "VN": ("Nguyen Minh Anh", "1 Nguyen Hue", "Ho Chi Minh City", "700000", "Ho Chi Minh"),
         "US": ("Alex Morgan", "1 Market Street", "San Francisco", "94105", "CA"),
         "GB": ("Alex Taylor", "10 King Street", "London", "SW1A 1AA", "London"),
         "FR": ("Alex Martin", "10 Rue de Rivoli", "Paris", "75001", "IDF"),
         "AU": ("Alex Wilson", "1 George Street", "Sydney", "2000", "NSW"),
         "JP": ("Haruto Sato", "1-1 Marunouchi", "Chiyoda", "100-0005", "Tokyo"),
         "KR": ("Minjun Kim", "30 Eulji-ro", "Seoul", "04533", "Seoul"),
+        "PH": ("Sofia Torres", "1000 Roxas Boulevard", "Manila", "1000", "Metro Manila"),
         "BA": ("Adnan Hadzic", "Zmaja od Bosne 7", "Sarajevo", "71000", ""),
+        "CH": ("Luca Meier", "Bahnhofstrasse 1", "Zurich", "8001", "ZH"),
     }
     geo = geo or {}
     name, line1, city, postal, state = rows.get(country, rows["US"])
@@ -313,6 +318,9 @@ def default_billing(country: str, email: str = "", tax_id: str = "", geo: dict[s
         "BR": ["Lucas Silva", "Gabriel Santos", "Mariana Costa", "Ana Oliveira"],
         "IN": ["Arjun Sharma", "Rahul Verma", "Priya Patel", "Ananya Singh"],
         "KR": ["Minjun Kim", "Jihoon Lee", "Seo-yeon Kim", "Ji-woo Park"],
+        "PH": ["Sofia Torres", "Maria Santos", "Angela Reyes", "Paolo Garcia", "Miguel Cruz"],
+        "VN": ["Nguyen Minh Anh", "Tran Quoc Bao", "Le Thu Ha", "Pham Gia Huy"],
+        "CH": ["Luca Meier", "Noah Keller", "Lea Schmid", "Mia Frei"],
     }
     if country in local_names:
         name = random.SystemRandom().choice(local_names[country])
@@ -393,6 +401,14 @@ def default_billing(country: str, email: str = "", tax_id: str = "", geo: dict[s
             name, line1, city, postal, state = rows["KR"]
             address_source = "country_profile_postal_fallback"
             place_name = "Lotte Hotel Seoul"
+    if country == "PH":
+        postal_digits = re.sub(r"\D", "", str(postal or ""))
+        if len(postal_digits) == 4:
+            postal = postal_digits
+        else:
+            postal = "1000"
+        city = str(city or "Manila").strip() or "Manila"
+        state = str(state or "Metro Manila").strip() or "Metro Manila"
     if country not in rows and address_source == "country_profile":
         line1 = "1 Main Street"
         postal = geo.get("postal") or "00000"
@@ -496,7 +512,7 @@ def create_provider_payment_method(
     billing: dict,
     log: Callable[[str], None],
 ) -> str:
-    """Create PIX/UPI PaymentMethod before confirming the Payment Page.
+    """Create a local PaymentMethod before confirming the Payment Page.
 
     Submitting local-method billing details inline on every confirm can create
     a new setup attempt after manual approval.  A standalone ``pm_*`` keeps the
@@ -1042,6 +1058,28 @@ def extract_provider_result(data: dict, provider: str) -> dict[str, Any]:
             "qr_image_svg": qr.get("image_url_svg") or "",
             "expires_at": qr.get("expires_at"),
         })
+    elif provider == "momo":
+        momo = (
+            na.get("momo_handle_redirect_or_display_qr_code")
+            or na.get("momo_display_qr_code")
+            or na.get("momo")
+            or {}
+        )
+        qr = momo.get("qr_code") if isinstance(momo, dict) else {}
+        qr = qr if isinstance(qr, dict) else {}
+        if isinstance(momo, dict):
+            result.update({
+                "provider_redirect_url": (
+                    momo.get("hosted_instructions_url")
+                    or momo.get("redirect_url")
+                    or momo.get("url")
+                    or redirect
+                ),
+                "qr_data": momo.get("data") or qr.get("data") or "",
+                "qr_image_png": momo.get("image_url_png") or qr.get("image_url_png") or "",
+                "qr_image_svg": momo.get("image_url_svg") or qr.get("image_url_svg") or "",
+                "expires_at": momo.get("expires_at") or qr.get("expires_at"),
+            })
     # Only accept Stripe next_action.redirect_to_url (or the generic redirect
     # extractor). A broad search for the word "ideal" also matches static
     # assets such as icon-pm-ideal@3x.png and creates a false success.
@@ -1070,7 +1108,7 @@ def stripe_to_provider(
 ) -> dict[str, Any]:
     provider = provider.lower()
     local_method_strategy = str(local_method_strategy or "standalone").lower()
-    late_promo = provider in {"pix", "upi"} and local_method_strategy == "late_promo"
+    late_promo = provider in {"pix", "upi", "momo"} and local_method_strategy == "late_promo"
     stage1 = stage1 or {}
     if provider == "paypal":
         redirect, pk, paypal_ctx = sc.stripe_to_paypal_redirect(
@@ -1180,8 +1218,12 @@ def stripe_to_provider(
         log("[pix] 第 6/7 步：创建独立 PIX PaymentMethod")
     elif provider == "upi":
         log("[upi] 正在创建独立 UPI PaymentMethod")
+    elif provider == "momo":
+        log("[momo] 正在创建 MoMo 支付请求")
+    elif provider == "twint":
+        log("[twint] 正在创建独立 TWINT PaymentMethod")
     payment_method_id = ""
-    if provider in {"pix", "upi"} and local_method_strategy == "standalone":
+    if provider in {"pix", "upi", "momo", "twint"} and local_method_strategy == "standalone":
         payment_method_id = create_provider_payment_method(
             http,
             pk,
@@ -1192,7 +1234,7 @@ def stripe_to_provider(
             billing,
             log,
         )
-    elif provider in {"pix", "upi"}:
+    elif provider in {"pix", "upi", "momo", "twint"}:
         log(f"[stripe] {provider} 本轮使用 {local_method_strategy} inline PaymentMethod 提交")
     confirm = confirm_provider_payment(
         http, pk, session_id, provider, init_data, version, ctx, profile, log,
@@ -1259,7 +1301,7 @@ def stripe_to_provider(
 
             setup_status = str(((confirm.get("setup_intent") or {}).get("status") or "")).lower()
             need_setup_recover = (
-                provider in {"upi", "pix"}
+                provider in {"upi", "pix", "momo"}
                 and not out.get("provider_redirect_url")
                 and not out.get("qr_image_png")
                 and not out.get("qr_data")

@@ -8,7 +8,7 @@
   fetch_publishable_key / init_checkout / fetch_elements_session /
   create_paypal_payment_method / confirm_payment / poll_result
 
-全程用 curl_cffi（chrome TLS 指纹）走支付代理；api.stripe.com 不在 Cloudflare 挑战后，
+全程用 curl_cffi（Firefox 144 TLS 指纹）走支付代理；api.stripe.com 不在 Cloudflare 挑战后，
 纯 HTTP 即可。ChatGPT 下单（/backend-api/payments/checkout）也尝试纯 HTTP（带 Bearer）。
 """
 
@@ -60,12 +60,18 @@ def _paypal_return_url(session_id: str, init_resp: dict, ctx: dict) -> str:
     query["ui_mode"] = "custom"
     return urlunsplit((parsed.scheme or "https", parsed.netloc or "checkout.stripe.com", parsed.path, urlencode(query), parsed.fragment))
 
-CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+FIREFOX_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+    "Gecko/20100101 Firefox/144.0"
 )
+# Compatibility alias used by the existing provider modules.
+CHROME_UA = FIREFOX_UA
 
 OPENAI_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
+
+# In-memory only: native Checkout passes this secret to Stripe Elements so
+# methods saved on the Checkout Customer can be redisplayed.
+CHECKOUT_CUSTOMER_SESSION_SECRETS: dict[str, str] = {}
 
 # OpenAI / OpenAI LLC 的 Stripe publishable key（账户分片 → pk）。
 KNOWN_PUBLISHABLE_KEYS = {
@@ -80,8 +86,10 @@ LOCALE_PROFILES = {
     "DE": {"browser_locale": "de-DE", "browser_timezone": "Europe/Berlin", "browser_language": "de-DE"},
     "FR": {"browser_locale": "fr-FR", "browser_timezone": "Europe/Paris", "browser_language": "fr-FR"},
     "NL": {"browser_locale": "nl-NL", "browser_timezone": "Europe/Amsterdam", "browser_language": "nl-NL"},
+    "CH": {"browser_locale": "de-CH", "browser_timezone": "Europe/Zurich", "browser_language": "de-CH"},
     "IN": {"browser_locale": "en-IN", "browser_timezone": "Asia/Kolkata", "browser_language": "en-IN"},
     "BR": {"browser_locale": "pt-BR", "browser_timezone": "America/Sao_Paulo", "browser_language": "pt-BR"},
+    "VN": {"browser_locale": "vi-VN", "browser_timezone": "Asia/Ho_Chi_Minh", "browser_language": "vi-VN"},
     "AU": {"browser_locale": "en-AU", "browser_timezone": "Australia/Sydney", "browser_language": "en-AU"},
     "CA": {"browser_locale": "en-CA", "browser_timezone": "America/Toronto", "browser_language": "en-CA"},
 }
@@ -107,7 +115,7 @@ COUNTRY_CURRENCY = {
 }
 
 # 支持 PayPal 的下单地区（EU/EUR）。US/USD 只有 card。
-PAYPAL_ORDER_COUNTRIES = ["US", "DE", "FR", "IE", "NL", "ES", "IT", "AT"]
+PAYPAL_ORDER_COUNTRIES = ["US", "GB", "DE", "FR", "IE", "NL", "ES", "IT", "AT"]
 
 
 def currency_for_country(country: str) -> str:
@@ -145,8 +153,9 @@ def _gen_elements_session_id() -> str:
 
 def _elements_options_client_payload() -> dict:
     return {
-        "elements_options_client[saved_payment_method][enable_save]": "never",
-        "elements_options_client[saved_payment_method][enable_redisplay]": "never",
+        # Match native Checkout so Customer-saved methods may be redisplayed.
+        "elements_options_client[saved_payment_method][enable_save]": "auto",
+        "elements_options_client[saved_payment_method][enable_redisplay]": "auto",
     }
 
 
@@ -218,10 +227,10 @@ def _paypal_setup_diagnostic(payload: dict) -> dict:
 
 
 def build_http(proxy: Optional[str]):
-    """curl_cffi Session（chrome136 TLS 指纹），跟随支付代理。"""
+    """curl_cffi Session（Firefox 144 TLS 指纹），跟随支付代理。"""
     from curl_cffi.requests import Session as CffiSession
 
-    http = CffiSession(impersonate="chrome136")
+    http = CffiSession(impersonate="firefox144")
     try:
         http.trust_env = False
     except Exception:
@@ -252,8 +261,6 @@ def create_chatgpt_order(
     ``currency`` 缺省时按 ``country`` 推导；PayPal funding 只在币种匹配地区时开放。
     """
     currency = (currency or currency_for_country(country)).upper()
-    m = re.search(r"Chrome/(\d+)", CHROME_UA)
-    chrome_major = int(m.group(1)) if m else 136
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -262,9 +269,6 @@ def create_chatgpt_order(
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
         "User-Agent": CHROME_UA,
-        "sec-ch-ua": f'"Not)A;Brand";v="8", "Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
@@ -308,6 +312,12 @@ def create_chatgpt_order(
         mm = re.search(r"cs_live_[A-Za-z0-9]+", text)
         sid = mm.group(0) if mm else None
     if sid:
+        customer_session_secret = str(
+            data.get("customer_session_client_secret") or ""
+        ).strip()
+        if customer_session_secret.startswith("cuss_secret_"):
+            CHECKOUT_CUSTOMER_SESSION_SECRETS[str(sid)] = customer_session_secret
+            log("[order] CustomerSession ?????????????????")
         return sid, None
     return None, f"no_session_id: {text[:200]}"
 
@@ -377,6 +387,8 @@ def verify_pk(http, session_id: str, log: Callable[[str], None]) -> str:
 
 
 def init_checkout(http, session_id: str, pk: str, profile: dict, log) -> tuple[dict, str, dict]:
+    if not re.fullmatch(r"cs_(?:live|test)_[A-Za-z0-9]+", str(session_id or "")):
+        raise RuntimeError(f"Stripe init requires a resolved cs_* session, got {session_id or '-'}")
     url = f"{STRIPE_API}/v1/payment_pages/{session_id}/init"
     stripe_js_id = str(uuid.uuid4())
     elements_session_id = _gen_elements_session_id()
@@ -417,6 +429,12 @@ def init_checkout(http, session_id: str, pk: str, profile: dict, log) -> tuple[d
             amount = total.get("due")
             if amount is None:
                 amount = (init_data.get("invoice") or {}).get("amount_due")
+            checkout_customer = init_data.get("customer") or {}
+            if not isinstance(checkout_customer, dict):
+                checkout_customer = {}
+            visible_saved_methods = checkout_customer.get("payment_methods") or []
+            if not isinstance(visible_saved_methods, list):
+                visible_saved_methods = []
             ctx = {
                 "stripe_js_id": stripe_js_id,
                 "elements_session_id": elements_session_id,
@@ -430,8 +448,17 @@ def init_checkout(http, session_id: str, pk: str, profile: dict, log) -> tuple[d
                 "init_checksum": init_data.get("init_checksum", ""),
                 "return_url": init_data.get("return_url") or "",
                 "stripe_hosted_url": init_data.get("stripe_hosted_url") or "",
+                "customer_has_fallback_payment_method": bool(
+                    checkout_customer.get("has_fallback_payment_method")
+                ),
+                "visible_saved_payment_method_count": len(visible_saved_methods),
             }
             log(f"[stripe] init ok version={version[:24]} amount={amount} currency={ctx['currency']} pm={ctx['payment_method_types']}")
+            log(
+                "[stripe] saved methods "
+                f"fallback={ctx['customer_has_fallback_payment_method']} "
+                f"visible={ctx['visible_saved_payment_method_count']}"
+            )
             if str(amount).strip() in {"0", "0.0", "0.00"}:
                 # Keep the fields that decide whether Checkout is confirming a
                 # PaymentIntent or a SetupIntent.  These are deliberately
@@ -483,6 +510,9 @@ def fetch_elements_session(http, pk: str, session_id: str, ctx: dict, version: s
         "type": "deferred_intent",
         "checkout_session_id": session_id,
     }
+    customer_session_secret = CHECKOUT_CUSTOMER_SESSION_SECRETS.get(session_id, "")
+    if customer_session_secret:
+        params["customer_session_client_secret"] = customer_session_secret
     for idx, pm in enumerate(pmt):
         params[f"deferred_intent[payment_method_types][{idx}]"] = pm
     try:
@@ -504,6 +534,19 @@ def fetch_elements_session(http, pk: str, session_id: str, ctx: dict, version: s
         ctx["payment_method_types"] = types
     diagnostic = _paypal_setup_diagnostic(data)
     ctx["paypal_elements_diagnostic"] = diagnostic
+    elements_customer = data.get("customer") or data.get("legacy_customer") or {}
+    if not isinstance(elements_customer, dict):
+        elements_customer = {}
+    saved_methods = elements_customer.get("payment_methods") or []
+    if not isinstance(saved_methods, list):
+        saved_methods = []
+    ctx["customer_session_present"] = bool(customer_session_secret)
+    ctx["elements_saved_payment_method_count"] = len(saved_methods)
+    log(
+        "[stripe] CustomerSession "
+        f"present={ctx['customer_session_present']} "
+        f"saved_methods={ctx['elements_saved_payment_method_count']}"
+    )
     if "paypal" in types or "paypal" in pmt:
         log(
             "[stripe] PayPal Elements setup diagnostic: "
@@ -960,6 +1003,51 @@ def approve_submission(chatgpt_http, access_token: str, session_id: str, process
     return payload
 
 
+def poll_paypal_redirect_light(
+    http,
+    pk: str,
+    session_id: str,
+    log,
+    *,
+    max_attempts: int = 1,
+    stage: str = "pre-approve",
+) -> str:
+    """Read Stripe's compact /poll view without creating a new submission.
+
+    Some zero-amount PayPal SetupIntents expose the buyer authorization URL
+    before merchant approval.  Keep this probe short: if the first submission
+    has no redirect, the outer provider loop should rebuild the Checkout rather
+    than repeatedly polling a stale submission.
+    """
+    url = f"{STRIPE_API}/v1/payment_pages/{session_id}/poll"
+    params = {"key": pk, "_stripe_version": STRIPE_VERSION_BASE}
+    for attempt in range(max(1, max_attempts)):
+        try:
+            resp = http.get(url, params=params, headers=_stripe_headers(), timeout=20)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[stripe] PayPal {stage} /poll exception: {type(exc).__name__}")
+            continue
+        if getattr(resp, "status_code", 0) != 200:
+            log(f"[stripe] PayPal {stage} /poll HTTP {getattr(resp, 'status_code', '?')}")
+            continue
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            payload = {}
+        redirect = extract_redirect_url(payload)
+        if redirect:
+            log(f"[stripe] PayPal {stage} /poll 已取得 buyer redirect")
+            return redirect
+        log(
+            f"[stripe] PayPal {stage} /poll 未返回 redirect："
+            f"state={payload.get('state') or ''}; "
+            f"payment_object_status={payload.get('payment_object_status') or ''}"
+        )
+        if attempt + 1 < max_attempts:
+            time.sleep(0.8)
+    return ""
+
+
 def poll_redirect_after_approve(http, pk: str, session_id: str, log, *, ctx: dict | None = None, max_attempts: int = 15) -> str:
     """approve 后 GET /payment_pages/<id> 轮询，拿 next_action.redirect_to_url。"""
     ctx = ctx or {}
@@ -1276,19 +1364,35 @@ def stripe_to_paypal_redirect(
         sub = confirm_data.get("submission_attempt") or {}
         if sub.get("state") == "requires_approval" and chatgpt_http is not None and access_token:
             pe = _processor_entity(confirm_data) or processor_entity
+            # Preserve the first confirmed submission.  Probe both Stripe's
+            # compact /poll view and one complete payment_pages snapshot before
+            # merchant approval; neither request creates a second submission.
+            pre_approve_redirect = poll_paypal_redirect_light(
+                payment_http, pk, session_id, log,
+                max_attempts=1, stage="pre-approve",
+            )
+            if not pre_approve_redirect:
+                pre_approve_redirect = poll_redirect_after_approve(
+                    payment_http, pk, session_id, log, ctx=ctx, max_attempts=1,
+                )
             log(f"[stripe] manual_approval（requires_approval）→ 调 ChatGPT approve（processor_entity={pe}）…")
             if approve_callback:
                 approve_callback(pe)
             else:
                 approve_submission(chatgpt_http, access_token, session_id, pe, log)
-            # 再次 confirm 会新建 submission 并重新回到 requires_approval。
-            # 用户侧实测首个 poll 未命中后继续等待也不会转好，因此只读取一次，
-            # 未命中就交给外层重建完整 Checkout。
-            redirect_url = poll_redirect_after_approve(
-                payment_http, pk, session_id, log, ctx=ctx, max_attempts=1,
+            # Reuse an early redirect if Stripe already exposed one. Otherwise
+            # read the approved submission once through /poll, then once through
+            # the full payment_pages representation. Never re-confirm here.
+            redirect_url = pre_approve_redirect or poll_paypal_redirect_light(
+                payment_http, pk, session_id, log,
+                max_attempts=1, stage="post-approve",
             )
             if not redirect_url:
-                raise RuntimeError("PayPal 首次 poll 未命中，正在更换代理重新尝试")
+                redirect_url = poll_redirect_after_approve(
+                    payment_http, pk, session_id, log, ctx=ctx, max_attempts=1,
+                )
+            if not redirect_url:
+                raise RuntimeError("PayPal buyer redirect 未生成，正在废弃当前 Checkout 并更换代理重试")
 
     if not redirect_url:
         try:

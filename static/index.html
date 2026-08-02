@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="/static/styles.css?v=20260726-kakao">
+  <link rel="stylesheet" href="/static/styles.css?v=20260728-momo-vn-1">
 </head>
 <body>
   <div class="paper-noise"></div>
@@ -67,10 +67,13 @@
           <legend>支付路径</legend>
           <div class="choice-grid rail-grid" id="railGrid">
             <label class="rail active"><input type="radio" name="link_type" value="hosted" checked><span class="rail-icon">↗</span><span><b>Hosted</b><small>官方支付长链</small></span></label>
+            <label class="rail"><input type="radio" name="link_type" value="ph_short"><span class="rail-icon">PH</span><span><b>菲律宾短链</b><small>US Checkout / TR 优惠</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="paypal"><span class="rail-icon">P</span><span><b>PayPal</b><small>Approve 跳转</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="ideal"><span class="rail-icon">iD</span><span><b>iDEAL</b><small>荷兰银行支付</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="upi"><span class="rail-icon">₹</span><span><b>UPI</b><small>印度二维码</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="pix"><span class="rail-icon">◇</span><span><b>PIX</b><small>巴西即时支付</small></span></label>
+            <label class="rail"><input type="radio" name="link_type" value="momo"><span class="rail-icon">M</span><span><b>MoMo</b><small>越南电子钱包</small></span></label>
+            <label class="rail"><input type="radio" name="link_type" value="gcash"><span class="rail-icon">G</span><span><b>GCash</b><small>菲律宾电子钱包</small></span></label>
             <label class="rail"><input type="radio" name="link_type" value="kakao"><span class="rail-icon">K</span><span><b>Kakao Pay</b><small>韩国 Nicepay 跳转</small></span></label>
           </div>
         </fieldset>
@@ -80,13 +83,14 @@
             <option value="US">US · 美国</option><option value="DE">DE · 德国</option>
             <option value="FR">FR · 法国</option><option value="NL">NL · 荷兰</option>
             <option value="IN">IN · 印度</option><option value="BR">BR · 巴西</option>
+            <option value="VN">VN · 越南</option>
             <option value="GB">GB · 英国</option><option value="JP">JP · 日本</option>
-            <option value="KR">KR · 韩国</option>
+            <option value="KR">KR · 韩国</option><option value="PH">PH ? 菲律宾</option>
             <option value="AU">AU · 澳大利亚</option><option value="CA">CA · 加拿大</option>
           </select></label>
           <label class="field"><span>币种</span><select id="currency">
             <option>USD</option><option>EUR</option><option>INR</option><option>BRL</option>
-            <option>GBP</option><option>JPY</option><option>KRW</option><option>AUD</option><option>CAD</option>
+            <option>GBP</option><option>JPY</option><option>KRW</option><option>VND</option><option>PHP</option><option>AUD</option><option>CAD</option>
           </select></label>
         </div>
         <p id="regionAutoHint" class="region-auto-hint" hidden>PayPal 的国家、地区和币种会根据代理池 2 自动识别。</p>
@@ -134,6 +138,12 @@
           <label class="switch"><input id="usePromo" type="checkbox" checked><span></span></label>
           <div><b>尝试优惠活动</b><small>资格不匹配时，上游会返回具体原因</small></div>
         </div>
+
+        <div class="toggle-line sentinel-combined-toggle">
+          <label class="switch"><input id="useSentinel" type="checkbox" checked><span></span></label>
+          <div><b>SEN + SO</b><small>同时生成并提交主令牌与附加令牌</small></div>
+        </div>
+        <p class="inline-note sentinel-note">关闭后 SEN 与 SO 会同时省略，并在任务日志中记录。</p>
 
         <div id="plusPromoFields" class="conditional-fields compact-fields">
           <label class="field"><span>Plus 优惠 Campaign <small>选填</small></span><input id="promoCampaign" placeholder="例如 plus-1-month-free"></label>
@@ -184,13 +194,13 @@
             <div><span>Session</span><code id="resultSession">—</code></div>
           </div>
           <label class="field result-link"><span>最终链接 / 付款码</span><textarea id="resultValue" readonly></textarea></label>
-          <div class="result-actions"><a id="openResult" class="primary-button" target="_blank" rel="noopener noreferrer">打开链接</a><button id="copyResult" class="secondary-button" type="button">复制结果</button></div>
+          <div class="result-actions"><a id="openResult" class="primary-button" target="_blank" rel="noopener noreferrer">打开长链</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button></div>
         </section>
       </aside>
     </section>
   </main>
 
   <footer><span>PAY.153.INK</span><p>任务完成后请及时使用链接；支付提供商生成的二维码通常具有有效期。</p></footer>
-  <script src="/static/app.js?v=20260726-kakao"></script>
+  <script src="/static/app.js?v=20260731-gcash-route-1"></script>
 </body>
 </html>

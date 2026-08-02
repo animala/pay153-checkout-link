@@ -21,9 +21,10 @@ const PROXY_STORAGE_KEYS = {
 const providerDefaults = {
   hosted: {country: 'US', currency: 'USD'}, paypal: {country: 'US', currency: 'USD'},
   ideal: {country: 'NL', currency: 'EUR'}, upi: {country: 'IN', currency: 'INR'},
-  pix: {country: 'BR', currency: 'BRL'}, kakao: {country: 'KR', currency: 'KRW'}
+  pix: {country: 'BR', currency: 'BRL'}, momo: {country: 'VN', currency: 'VND'}, gcash: {country: 'PH', currency: 'PHP'}, kakao: {country: 'KR', currency: 'KRW'},
+  ph_short: {country: 'PH', currency: 'PHP'}
 };
-const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',GB:'GBP',JP:'JPY',KR:'KRW',AU:'AUD',CA:'CAD'};
+const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',VN:'VND',GB:'GBP',JP:'JPY',KR:'KRW',PH:'PHP',AU:'AUD',CA:'CAD'};
 
 function proxyLines(node){
   return node.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
@@ -88,20 +89,23 @@ function syncFields(applyRailDefault=false){
   const promoSupported = plan === 'plus';
   $('promoLine').style.display = promoSupported ? 'flex' : 'none';
   $('plusPromoFields').hidden = !promoSupported || !$('usePromo').checked;
-  const needsExit = rail !== 'hosted' && rail !== 'pix';
+  const needsExit = rail !== 'hosted' && rail !== 'pix' && rail !== 'momo';
   $('proxyGrid').classList.toggle('single', !needsExit);
   $('exitProxyField').hidden = !needsExit;
   $('exitProxy').required = needsExit;
   $('copyEntryProxy').hidden = !needsExit;
   const recommendations = {
     hosted: '推荐代理：使用账号常用地区。',
+    ph_short: '推荐代理：代理池 1 使用 US 创建 PH/PHP Checkout，代理池 2 使用 TR 应用优惠。',
     paypal: '\u63a8\u8350\u4ee3\u7406\uff1a\u7cfb\u7edf\u4f18\u5148\u4f7f\u7528\u4ee3\u7406\u6c60 2 \u5f53\u524d\u56fd\u5bb6\u7684 PayPal \u8d26\u5355\uff1b\u82e5\u8be5\u56fd\u5bb6 Checkout \u672a\u5f00\u653e PayPal\uff0c\u5219\u81ea\u52a8\u56de\u9000\u5fb7\u56fd DE/EUR \u8d26\u5355\u3002',
     ideal: '推荐代理：两个代理池均使用 NL。',
     upi: '推荐代理：代理池 1 使用可获得优惠资格的国家或地区（如 TR、JP、BR），代理池 2 使用 IN 创建并处理 UPI。',
     pix: '推荐代理：代理池 1 使用 BR。',
+    momo: '推荐代理：代理池 1 全程使用 VN，Checkout、优惠、Stripe 与确认均保持同一条越南线路。',
+    gcash: '推荐代理：代理池 1 使用 US 创建 PH/PHP 账单，代理池 2 使用你选择的优惠国家。',
     kakao: '推荐代理：代理池 1 使用 VN 应用优惠，代理池 2 使用 KR 创建并处理 Kakao Pay。'
   };
-  const pool2Hints = {paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN',kakao:'推荐 KR'};
+  const pool2Hints = {ph_short:'必须 TR',paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN',kakao:'推荐 KR'};
   const recommendation = recommendations[rail] || '推荐代理：使用与所选地区一致的代理。';
   $('proxyRecommendation').textContent = recommendation;
   $('proxyFootHint').textContent = recommendation;
@@ -207,13 +211,20 @@ function showResult(result){
   const resultProvider = String(result.link_type || result.provider || '').toLowerCase();
   const isIdeal = resultProvider === 'ideal';
   const isKakao = resultProvider === 'kakao';
-  const finalValue = (isIdeal || isKakao)
+  const isCodexLow = String(result.plan || '').toLowerCase() === 'codex_low';
+  const codexShortLink = isCodexLow && result.checkout_session_id
+    ? (result.short_link || result.verification_url || `https://chatgpt.com/checkout/openai_llc/${result.checkout_session_id}`)
+    : '';
+  const finalValue = codexShortLink || result.short_link || result.verification_url || ((isIdeal || isKakao)
     ? (result.provider_redirect_url || result.checkout_url || result.qr_data || '')
-    : (result.qr_data || result.provider_redirect_url || result.checkout_url || '');
+    : (result.qr_data || result.provider_redirect_url || result.checkout_url || ''));
   $('resultValue').value = finalValue;
-  const openUrl = result.provider_redirect_url || result.checkout_url || '';
+  const openUrl = codexShortLink || result.short_link || result.verification_url || result.provider_redirect_url || result.checkout_url || '';
   $('openResult').href = openUrl || '#';
   $('openResult').style.display = openUrl ? 'inline-flex' : 'none';
+  const verifyUrl = result.verification_url || '';
+  $('verifyResult').href = verifyUrl || '#';
+  $('verifyResult').hidden = !verifyUrl;
   const qr = isIdeal
     ? (result.qr_image_svg || result.qr_image_png || '')
     : (result.qr_image_png || result.qr_image_svg || '');
@@ -252,6 +263,8 @@ form.addEventListener('submit', async (event) => {
     token: $('token').value, plan, link_type: selected('link_type'), country: $('country').value,
     currency: $('currency').value, entry_proxies: proxyLines($('entryProxy')), exit_proxies: proxyLines($('exitProxy')),
     retry_count: Math.max(1, Math.min(50, Number($('retryCount').value || 10))),
+    use_sen: $('useSentinel').checked,
+    use_so: $('useSentinel').checked,
     use_promo: plan === 'plus' && $('usePromo').checked,
     promo_campaign: plan === 'plus' ? $('promoCampaign').value.trim() : '',
     promo_code: plan === 'team' ? $('promoCode').value.trim() : '',

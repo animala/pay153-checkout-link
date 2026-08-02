@@ -11,6 +11,7 @@ import secrets
 import random
 import threading
 import time
+import unicodedata
 import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,21 +24,17 @@ from curl_cffi import requests
 
 import stripe_checkout as sc
 from provider_checkout import PROVIDER_DEFAULTS, default_billing, stripe_to_provider
+from billing_address_resolver import resolve_cached_country_address
 from sentinel_token import SentinelTokenProvider as BaseSentinel
 from upi_go_runner import available as upi_go_available, run_upi as run_upi_go
-from grok_trial import (
-    account_credentials as grok_account_credentials,
-    complete_braintree_paypal_approval as grok_complete_braintree_paypal_approval,
-    create_braintree_agreement_link as grok_create_braintree_agreement_link,
-    create_braintree_session as grok_create_braintree_session,
-    generate_trial_link,
-    pool_summary as grok_pool_summary,
-    register_braintree_agreement as grok_register_braintree_agreement,
-    resolve_braintree_agreement as grok_resolve_braintree_agreement,
-    subscribe_via_braintree as grok_subscribe_via_braintree,
-    verify_subscription as grok_verify_subscription,
+from ph_short_extractor import (
+    CheckoutExtractor as PhShortCheckoutExtractor,
+    ExtractorConfig as PhShortExtractorConfig,
+    checkout_amount_minor as custom_checkout_amount_minor,
+    checkout_currency as custom_checkout_currency,
+    checkout_state_from_html as custom_checkout_state_from_html,
+    parse_credentials as parse_ph_short_credentials,
 )
-
 
 ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
@@ -49,6 +46,99 @@ UPI_ENABLED = str(os.getenv("PAY153_UPI_ENABLED", "0")).strip().lower() in {
 }
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.config["JSON_AS_ASCII"] = False
+
+ROTATING_PAYPAL_ADDRESS_COUNTRIES = {"NL", "GB", "TH", "BR", "US"}
+DYNAMIC_PROXY_API_URL = str(
+    os.getenv("PAY153_DYNAMIC_PROXY_API")
+    or "https://white.1024proxy.com/white/api"
+).strip()
+DYNAMIC_PROXY_API_LOCK = threading.Lock()
+DYNAMIC_PROXY_API_LAST_AT = 0.0
+DYNAMIC_PROXY_API_MIN_INTERVAL = max(
+    0.1, float(os.getenv("PAY153_DYNAMIC_PROXY_MIN_INTERVAL") or 0.35)
+)
+
+
+def _ascii_key(value: Any) -> str:
+    return "".join(
+        character for character in unicodedata.normalize("NFKD", str(value or ""))
+        if not unicodedata.combining(character)
+    ).strip().lower()
+
+
+def normalize_rotating_paypal_address(country: str, value: dict[str, Any]) -> dict[str, str] | None:
+    country = str(country or "").upper()
+    line1 = str(value.get("line1") or "").strip()
+    city = str(value.get("city") or "").strip()
+    postal = str(value.get("postal_code") or "").strip().upper()
+    state = str(value.get("state") or "").strip()
+    if not line1 or not city or not postal:
+        return None
+    if country == "NL":
+        compact = re.sub(r"\s+", "", postal)
+        if not re.fullmatch(r"[1-9][0-9]{3}[A-Z]{2}", compact):
+            return None
+        postal, state = f"{compact[:4]} {compact[4:]}", ""
+    elif country == "GB":
+        compact = re.sub(r"\s+", "", postal)
+        if not re.fullmatch(r"[A-Z0-9]{5,7}", compact):
+            return None
+        postal, state = f"{compact[:-3]} {compact[-3:]}", ""
+    elif country == "TH":
+        digits = re.sub(r"\D", "", postal)
+        if len(digits) != 5:
+            return None
+        postal, state = digits, ""
+    elif country == "BR":
+        digits = re.sub(r"\D", "", postal)
+        if len(digits) != 8:
+            return None
+        br_states = {
+            "acre": "AC", "alagoas": "AL", "amapa": "AP", "amazonas": "AM",
+            "bahia": "BA", "ceara": "CE", "distrito federal": "DF",
+            "espirito santo": "ES", "goias": "GO", "maranhao": "MA",
+            "mato grosso": "MT", "mato grosso do sul": "MS", "minas gerais": "MG",
+            "para": "PA", "paraiba": "PB", "parana": "PR", "pernambuco": "PE",
+            "piaui": "PI", "rio de janeiro": "RJ", "rio grande do norte": "RN",
+            "rio grande do sul": "RS", "rondonia": "RO", "roraima": "RR",
+            "santa catarina": "SC", "sao paulo": "SP", "sergipe": "SE",
+            "tocantins": "TO",
+        }
+        state = state.upper() if re.fullmatch(r"[A-Z]{2}", state.upper()) else br_states.get(_ascii_key(state), "")
+        if not state:
+            return None
+        postal = digits
+    elif country == "US":
+        match = re.search(r"\b[0-9]{5}(?:-[0-9]{4})?\b", postal)
+        if not match:
+            return None
+        us_states = {
+            "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+            "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+            "district of columbia": "DC", "florida": "FL", "georgia": "GA", "hawaii": "HI",
+            "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+            "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME",
+            "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+            "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+            "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
+            "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH",
+            "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI",
+            "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
+            "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+            "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+        }
+        state = state.upper() if re.fullmatch(r"[A-Z]{2}", state.upper()) else us_states.get(_ascii_key(state), "")
+        if not state:
+            return None
+        postal = match.group(0)
+    return {
+        "country": country,
+        "line1": line1,
+        "line2": "",
+        "city": city,
+        "postal_code": postal,
+        "state": state,
+    }
 
 
 def remember_rust_job_alias(public_job_id: str, rust_job_id: str, metadata: dict[str, Any]) -> None:
@@ -68,7 +158,7 @@ def remember_rust_job_alias(public_job_id: str, rust_job_id: str, metadata: dict
             "rust_job_id": str(rust_job_id),
             "created_at": now,
             **{str(key): value for key, value in metadata.items() if key in {
-                "plan", "link_type", "country", "currency",
+                "plan", "link_type", "country", "currency", "use_promo", "promo_campaign",
             }},
         }
         RUST_ALIAS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -110,11 +200,20 @@ def rust_job_public_snapshot(public_job_id: str) -> dict[str, Any] | None:
         "cancelled": "cancelled",
     }
     result = dict(job.get("result") or {})
+    explicit_promo_requested = result.get("promo_requested")
+    if explicit_promo_requested is None:
+        explicit_promo_requested = alias.get("use_promo")
+    if explicit_promo_requested is None:
+        # Older Rust aliases did not persist use_promo.  A Rust result only
+        # contains promo_applied after the promotion branch was requested.
+        explicit_promo_requested = result.get("promo_applied") is not None
     result.update({
         "plan": alias.get("plan") or result.get("plan"),
         "link_type": alias.get("link_type") or result.get("link_type"),
         "country": alias.get("country") or result.get("country"),
         "currency": str(result.get("currency") or alias.get("currency") or "").upper(),
+        "promo_requested": bool(explicit_promo_requested),
+        "promo_campaign_used": result.get("promo_campaign_used") or alias.get("promo_campaign") or "",
         "rust_workflow": True,
     })
     if result.get("link_type") == "paypal":
@@ -140,7 +239,18 @@ STRIPE_CHECKOUT_FRAGMENT = (
     "E9icEZTRGl0Rn1hfUZQc2pXbTRdUnJXZGZTbGpzUDZuSU5zdW5vbTJMdG5SNTVsXVR2b2o2aycpJ2"
     "N3amhWYHdzYHcnP3F3cGApJ2dkZm5id2pwa2FGamlqdyc%2FJyZjY2NjY2MnKSdpZHxqcHFRfHVgJ"
     "z8ndmxrYmlgWmxxYGgnKSdga2RnaWBVaWRmYG1qaWFgd3YnP3F3cGB4JSUl"
-)
+ )
+
+
+def normalize_hosted_checkout_url(url: str, session_id: str = "") -> str:
+    """Return an OpenAI hosted Checkout URL that can be opened directly."""
+    value = str(url or "").strip()
+    if not value and session_id:
+        value = f"https://pay.openai.com/c/pay/{session_id}"
+    if value.startswith("https://checkout.stripe.com/c/pay/"):
+        value = "https://pay.openai.com" + value[len("https://checkout.stripe.com"):]
+    return value
+
 
 PLANS = {
     "plus": "chatgptplusplan",
@@ -212,12 +322,12 @@ def normalize_paypal_checkout_region(country: str, detected_currency: str = "") 
 
 class ProxySentinel(BaseSentinel):
     def __init__(self, proxy: str | None, cookies: dict[str, str]):
-        super().__init__(impersonate="chrome136", cookies=cookies)
+        super().__init__(impersonate="firefox144", cookies=cookies)
         self.proxy = proxy
 
     async def _get_session(self):
         if not self._session:
-            kwargs: dict[str, Any] = {"impersonate": "chrome", "timeout": 70}
+            kwargs: dict[str, Any] = {"impersonate": "firefox144", "timeout": 70}
             if self.proxy:
                 kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
             self._session = requests.AsyncSession(**kwargs)
@@ -355,6 +465,51 @@ def normalize_proxy_pool(raw: Any, label: str) -> list[str]:
     return normalized
 
 
+def fetch_dynamic_attempt_proxy(country: str, session_time: int = 10) -> str:
+    """Fetch exactly one fresh regional proxy for the current outer attempt."""
+
+    country = str(country or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        raise ValueError(f"Invalid dynamic proxy country: {country or '-'}")
+    session_time = min(120, max(1, int(session_time or 10)))
+    global DYNAMIC_PROXY_API_LAST_AT
+    last_error = ""
+    for api_attempt in range(1, 5):
+        try:
+            with DYNAMIC_PROXY_API_LOCK:
+                wait_seconds = DYNAMIC_PROXY_API_MIN_INTERVAL - (
+                    time.monotonic() - DYNAMIC_PROXY_API_LAST_AT
+                )
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                response = requests.get(
+                    DYNAMIC_PROXY_API_URL,
+                    params={
+                        "region": country,
+                        "num": 1,
+                        "time": session_time,
+                        "format": "1",
+                        "type": "txt",
+                    },
+                    timeout=25,
+                    impersonate="firefox144",
+                )
+                DYNAMIC_PROXY_API_LAST_AT = time.monotonic()
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            proxies = normalize_proxy_pool(response.text, f"{country} dynamic proxy")
+            if not proxies:
+                raise RuntimeError("empty response")
+            return proxies[0]
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if api_attempt < 4:
+                time.sleep(0.25 * api_attempt + random.random() * 0.2)
+    raise RuntimeError(
+        f"Dynamic proxy API did not return a valid {country} proxy after 4 attempts: {last_error}"
+    )
+
+
 def generate_cpf() -> str:
     digits = [secrets.randbelow(10) for _ in range(9)]
     for weights in (range(10, 1, -1), range(11, 1, -1)):
@@ -427,22 +582,45 @@ def lookup_cnpj_identity(cnpj: str) -> dict[str, str]:
     }
 
 
-async def sentinel_headers(proxy: str, flow: str, device_id: str, cookie: str) -> dict[str, str]:
-    provider = ProxySentinel(proxy or None, {"oai-did": cookie})
-    try:
-        token, so, diag = await provider.get_token_pair(flow, device_id)
-        if not token:
-            raise RuntimeError("Sentinel token 生成失败")
-        if diag.get("turnstile_required") and not diag.get("has_t"):
-            raise RuntimeError("Sentinel 缺少 t")
-        if diag.get("so_required") and not diag.get("has_so"):
-            raise RuntimeError("Sentinel 缺少 so")
-        out = {"OpenAI-Sentinel-Token": json.dumps(token, separators=(",", ":"))}
-        if so:
-            out["OpenAI-Sentinel-SO-Token"] = json.dumps(so, separators=(",", ":"))
-        return out
-    finally:
-        await provider.close()
+async def sentinel_headers(
+    proxy: str,
+    flow: str,
+    device_id: str,
+    cookie: str,
+    *,
+    use_sen: bool = True,
+    use_so: bool = True,
+) -> dict[str, str]:
+    if not use_sen and not use_so:
+        return {}
+    last_error = "empty token"
+    for attempt in range(2):
+        provider = ProxySentinel(proxy or None, {"oai-did": cookie})
+        try:
+            token, so, diag = await provider.get_token_pair(flow, device_id)
+            init_error = str(diag.get("init_error") or getattr(provider, "_last_init_error", "") or "")
+            if use_sen and not token:
+                last_error = init_error or "empty token"
+                if "SENTINEL_INIT_BLOCKED" in last_error:
+                    break
+            elif use_sen and diag.get("turnstile_required") and not diag.get("has_t"):
+                last_error = "required t proof was not generated"
+            elif use_so and diag.get("so_required") and not diag.get("has_so"):
+                last_error = "required so proof was not generated"
+            else:
+                out: dict[str, str] = {}
+                if use_sen and token:
+                    out["OpenAI-Sentinel-Token"] = json.dumps(token, separators=(",", ":"))
+                if use_so and so:
+                    out["OpenAI-Sentinel-SO-Token"] = json.dumps(so, separators=(",", ":"))
+                return out
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            await provider.close()
+        if attempt == 0:
+            await asyncio.sleep(0.6)
+    raise RuntimeError(f"Sentinel token generation failed after fresh-session retry: {last_error[:320]}")
 
 
 def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
@@ -458,7 +636,7 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
         "plan_name": PLANS[plan],
         "billing_details": billing,
         "cancel_url": "https://chatgpt.com/",
-        "checkout_ui_mode": "custom" if options["link_type"] != "hosted" or plan == "codex_low" else "redirect",
+        "checkout_ui_mode": "custom" if options["link_type"] != "hosted" else "redirect",
         "check_card_proxy": True,
     }
     promo = options.get("promo_campaign", "").strip()
@@ -484,7 +662,7 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
             "auto_top_up_enabled": True,
         }
     elif plan == "plus" and options.get("use_promo") and (
-        options.get("link_type") not in {"pix", "paypal", "upi", "ideal"}
+        options.get("link_type") not in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}
         or options.get("promo_on_create")
     ):
         common["promo_campaign"] = {
@@ -494,17 +672,33 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
     return common
 
 
-def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: str, log) -> dict:
+def create_checkout(
+    token: str,
+    payload: dict,
+    proxy: str,
+    device_id: str,
+    did: str,
+    log,
+    *,
+    use_sen: bool = True,
+    use_so: bool = True,
+) -> dict:
     http = sc.build_http(proxy or None)
     try:
         http.cookies.set("oai-did", did, domain="chatgpt.com")
     except Exception:
         pass
     try:
-        http.get("https://chatgpt.com/", headers={"User-Agent": sc.CHROME_UA}, timeout=35)
+        http.get(
+            "https://chatgpt.com/api/auth/csrf",
+            headers={"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+            timeout=20,
+        )
     except Exception as exc:
         log(f"ChatGPT 暖身提示：{type(exc).__name__}")
-    s_headers = asyncio.run(sentinel_headers(proxy, "chatgpt_checkout", device_id, did))
+    s_headers = asyncio.run(sentinel_headers(
+        proxy, "chatgpt_checkout", device_id, did, use_sen=use_sen, use_so=use_so,
+    ))
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -525,7 +719,9 @@ def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: 
         data = resp.json()
     except Exception:
         raise RuntimeError(f"OpenAI Checkout 返回非 JSON：{text[:300]}")
-    sid = data.get("checkout_session_id") or ""
+    raw_sid = str(data.get("checkout_session_id") or "")
+    sid_match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", raw_sid)
+    sid = sid_match.group(0) if sid_match else ""
     url = data.get("url") or ""
     if not sid and url:
         match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", url)
@@ -533,8 +729,20 @@ def create_checkout(token: str, payload: dict, proxy: str, device_id: str, did: 
     if not sid:
         match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", text)
         sid = match.group(0) if match else ""
+    if not sid:
+        custom_match = re.search(r"oaics_[A-Za-z0-9]+", "\n".join((raw_sid, str(url), text)))
+        if custom_match:
+            custom_id = custom_match.group(0)
+            processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
+            data["checkout_session_id"] = custom_id
+            data["checkout_provider"] = str(data.get("checkout_provider") or "open_ai")
+            data["processor_entity"] = processor
+            data["is_custom_checkout"] = True
+            data["source_checkout_url"] = str(url or "")
+            data["checkout_url"] = f"https://chatgpt.com/checkout/{processor}/{custom_id}"
+            return {"data": data, "http": http}
     data["checkout_session_id"] = sid
-    data["checkout_url"] = url or (f"https://pay.openai.com/c/pay/{sid}{STRIPE_CHECKOUT_FRAGMENT}" if sid else "")
+    data["checkout_url"] = normalize_hosted_checkout_url(url, sid)
     return {"data": data, "http": http}
 
 
@@ -674,25 +882,57 @@ def promo_campaign_from_payload(payload: Any) -> str:
     return candidates[0] if candidates else ""
 
 
+def proxy_country_hint(proxy: str) -> str:
+    value = unquote(str(proxy or ""))
+    for pattern in (
+        r"(?i)(?:^|[-_:])region[-_=]?([a-z]{2})(?:[-_:]|$)",
+        r"(?i)(?:^|[-_:])country[-_=]?([a-z]{2})(?:[-_:]|$)",
+        r"(?i)(?:^|[-_:])location[-_=]?([a-z]{2})(?:[-_:]|$)",
+    ):
+        match = re.search(pattern, value)
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
 def proxy_geo(proxy: str) -> dict[str, str]:
-    http = sc.build_http(proxy)
+    hinted_country = proxy_country_hint(proxy)
+    if hinted_country:
+        return {
+            "country": hinted_country, "currency": "", "region": "代理参数",
+            "city": "", "postal": "", "timezone": "", "source": "proxy_hint",
+        }
     probes = (
         "https://ipapi.co/json/",
-        "http://ip-api.com/json/?fields=status,countryCode,regionName,city,zip,timezone,currency,query",
+        "https://ipwho.is/",
+        "https://api.country.is/",
+        "https://api.ip.sb/geoip",
         "https://ipinfo.io/json",
     )
     errors: list[str] = []
     for url in probes:
         try:
-            resp = http.get(url, timeout=20)
+            # A failed TLS tunnel can poison a keep-alive connection. Use a
+            # fresh browser session for each independent geo provider.
+            http = sc.build_http(proxy)
+            resp = http.get(url, timeout=12)
             if resp.status_code != 200:
                 errors.append(f"HTTP {resp.status_code}")
                 continue
             data = resp.json() or {}
-            country = str(data.get("country") or data.get("country_code") or data.get("countryCode") or "").upper()
-            if len(country) != 2:
+            if data.get("success") is False:
+                errors.append("provider_failed")
                 continue
-            currency = str(data.get("currency") or "").strip().upper()
+            country = str(
+                data.get("country_code") or data.get("countryCode")
+                or data.get("country") or data.get("country_code2") or ""
+            ).upper()
+            if not re.fullmatch(r"[A-Z]{2}", country):
+                continue
+            currency_value = data.get("currency") or ""
+            if isinstance(currency_value, dict):
+                currency_value = currency_value.get("code") or ""
+            currency = str(currency_value).strip().upper()
             if not re.fullmatch(r"[A-Z]{3}", currency):
                 currency = ""
             return {
@@ -702,10 +942,11 @@ def proxy_geo(proxy: str) -> dict[str, str]:
                 "city": str(data.get("city") or ""),
                 "postal": str(data.get("postal") or data.get("zip") or ""),
                 "timezone": str(data.get("timezone") or ""),
+                "source": url,
             }
         except Exception as exc:
             errors.append(type(exc).__name__)
-    raise RuntimeError(f"代理地区检测失败：{' / '.join(errors[-3:]) or 'no response'}")
+    raise RuntimeError(f"代理地区检测失败：{' / '.join(errors[-5:]) or 'no response'}")
 
 
 _PROXY_GEO_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
@@ -760,7 +1001,10 @@ def select_paypal_exit_proxy(preferred: str, pool: list[str], scan_limit: int = 
     )
 
 
-def proxy_country(proxy: str) -> tuple[str, str]:
+def proxy_country(proxy: str, expected_country: str = "") -> tuple[str, str]:
+    expected = str(expected_country or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", expected):
+        return expected, "国家代理池"
     data = proxy_geo_cached(proxy)
     return data["country"], data["region"]
 
@@ -813,6 +1057,181 @@ def update_checkout_promo(
         return resp.json() or {}
     except Exception:
         return {}
+
+
+def fetch_custom_checkout_session(
+    http,
+    token: str,
+    session_id: str,
+    processor_entity: str,
+    device_id: str,
+) -> dict[str, Any]:
+    resp = http.get(
+        f"https://chatgpt.com/backend-api/payments/checkout/{processor_entity}/{session_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+            "User-Agent": sc.CHROME_UA,
+            "OAI-Device-Id": device_id,
+        },
+        timeout=45,
+    )
+    text = resp.text or ""
+    if resp.status_code != 200:
+        raise RuntimeError(f"读取自定义 Checkout 失败：HTTP {resp.status_code} {text[:300]}")
+    try:
+        return resp.json() or {}
+    except Exception:
+        raise RuntimeError(f"读取自定义 Checkout 返回非 JSON：{text[:300]}")
+
+
+def submit_custom_checkout_taxes(
+    http,
+    token: str,
+    session_id: str,
+    processor_entity: str,
+    billing: dict[str, Any],
+    currency: str,
+    device_id: str,
+) -> dict[str, Any]:
+    address = dict(billing.get("address") or {})
+    clean_address = {
+        "country": str(address.get("country") or "PH").upper(),
+        "line1": str(address.get("line1") or ""),
+        "line2": str(address.get("line2") or ""),
+        "city": str(address.get("city") or ""),
+        "state": str(address.get("state") or ""),
+        "postal_code": str(address.get("postal_code") or ""),
+    }
+    resp = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/taxes",
+        json={
+            "checkout_session_id": session_id,
+            "checkout_email": str(billing.get("email") or ""),
+            "billing_country": clean_address["country"],
+            "billing_name": str(billing.get("name") or ""),
+            "currency": str(currency or "PHP").upper(),
+            "tax_id": str(billing.get("tax_id") or "") or None,
+            "processor_entity": processor_entity,
+            "billing_address": clean_address,
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+            "User-Agent": sc.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/taxes",
+            "x-openai-target-route": "/backend-api/payments/checkout/taxes",
+        },
+        timeout=50,
+    )
+    text = resp.text or ""
+    if resp.status_code != 200:
+        raise RuntimeError(f"提交 PH 账单地址失败：HTTP {resp.status_code} {text[:300]}")
+    try:
+        payload = resp.json() or {}
+    except Exception as exc:
+        raise RuntimeError(f"提交 PH 账单地址返回非 JSON：{text[:300]}") from exc
+    checkout = payload.get("checkout_session") or {}
+    return checkout if isinstance(checkout, dict) else {}
+
+
+def confirm_custom_checkout_method(
+    http,
+    token: str,
+    session_id: str,
+    processor_entity: str,
+    custom_payment_method_id: str,
+    proxy: str,
+    device_id: str,
+    did: str,
+    *,
+    use_sen: bool = True,
+    use_so: bool = True,
+    method_name: str = "GCash",
+) -> dict[str, Any]:
+    sentinel = asyncio.run(sentinel_headers(
+        proxy, "checkout_session_approval", device_id, did,
+        use_sen=use_sen, use_so=use_so,
+    ))
+    resp = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/confirm",
+        json={
+            "checkout_session_id": session_id,
+            "selected_payment_method_type": custom_payment_method_id,
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+            "User-Agent": sc.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/confirm",
+            "x-openai-target-route": "/backend-api/payments/checkout/confirm",
+            **sentinel,
+        },
+        timeout=50,
+    )
+    text = resp.text or ""
+    if resp.status_code != 200:
+        raise RuntimeError(f"确认 {method_name} 支付方式失败：HTTP {resp.status_code} {text[:300]}")
+    try:
+        payload = resp.json() or {}
+    except Exception:
+        raise RuntimeError(f"确认 {method_name} 支付方式返回非 JSON：{text[:300]}")
+    if str(payload.get("status") or "").lower() != "success":
+        status = str(payload.get("status") or "unknown").lower()
+        if status == "blocked":
+            raise RuntimeError(f"CUSTOM_CONFIRM_BLOCKED: {method_name} 支付方式确认被上游拦截")
+        raise RuntimeError(f"确认 {method_name} 支付方式失败：status={status}；{text[:300]}")
+    return payload
+
+
+def start_custom_checkout_method(
+    http,
+    token: str,
+    session_id: str,
+    processor_entity: str,
+    custom_payment_method_id: str,
+    device_id: str,
+) -> dict[str, Any]:
+    resp = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/start",
+        json={
+            "checkout_session_id": session_id,
+            "custom_payment_method_type_id": custom_payment_method_id,
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+            "User-Agent": sc.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/custom_payment_method/start",
+            "x-openai-target-route": "/backend-api/payments/checkout/custom_payment_method/start",
+        },
+        timeout=60,
+    )
+    text = resp.text or ""
+    if resp.status_code != 200:
+        raise RuntimeError(f"启动 GCash 支付失败：HTTP {resp.status_code} {text[:300]}")
+    try:
+        payload = resp.json() or {}
+    except Exception:
+        raise RuntimeError(f"启动 GCash 支付返回非 JSON：{text[:300]}")
+    action = payload.get("next_action") or {}
+    if str(payload.get("status") or "").lower() != "requires_action" or not action.get("url"):
+        raise RuntimeError(f"GCash 未返回跳转链接：{text[:300]}")
+    return payload
+
 
 
 def approve_checkout(
@@ -889,7 +1308,7 @@ class JobStore:
             "提链尝试", "代理池", "代理校验", "自动设置地区", "计划=",
             "优惠已", "优惠更新", "优惠同步", "金额校验", "今日应付",
             "Checkout 创建", "支付方式已创建", "二维码生成", "链接生成",
-            "提交 Checkout approval", "错误：", "本次未成功",
+            "提交 Checkout approval", "错误：", "本次未成功", "轮未命中",
         )) or any(marker in lowered for marker in (
             "init ok", "payment_method:", "manual_approval approve", "checkout/update",
         ))
@@ -1004,7 +1423,7 @@ class JobStore:
                     self.jobs.pop(key, None)
             self.jobs[job_id] = {
                 "id": job_id, "status": "queued", "percent": 2, "text": "任务已创建",
-                "logs": [], "result": None, "error": "", "cancel": False,
+                "logs": [], "result": None, "error": "", "last_retry_error": "", "cancel": False,
                 "created_at": now, "updated_at": now, "queue_position": 0, "dispatched": False,
             }
             options = dict(options)
@@ -1014,7 +1433,7 @@ class JobStore:
                     internal=True,
                     dispatched=True,
                     queue_position=0,
-                    text="?????????",
+                    text="内部任务已启动",
                 )
                 future = self.internal_pool.submit(self._run, job_id, options)
                 future.add_done_callback(self._internal_worker_done)
@@ -1025,7 +1444,7 @@ class JobStore:
         self._append_backend_log(
             job_id,
             "SYSTEM",
-            "???????????????" if internal else "??????????",
+            "内部任务已直接分发" if internal else "公开任务已入队",
         )
         return job_id
 
@@ -1128,27 +1547,84 @@ class JobStore:
         max_attempts = min(50, max(1, int(options.get("retry_count") or 1)))
         used_pairs: set[tuple[str, str]] = set()
         last_error = ""
-        paypal_force_de_fallback = False
+        oaics_hits = 0
+        requested_paypal_country = str(
+            options.get("checkout_country") or options.get("country") or "US"
+        ).upper()
+        direct_paypal_countries = {
+            str(item).upper() for item in getattr(sc, "PAYPAL_ORDER_COUNTRIES", [])
+        }
+        paypal_force_de_fallback = bool(
+            options.get("link_type") == "paypal"
+            and requested_paypal_country not in direct_paypal_countries
+        )
+        if paypal_force_de_fallback:
+            self.log(
+                job_id,
+                f"PayPal billing country {requested_paypal_country} uses DE/EUR fallback from attempt 1",
+            )
         for attempt in range(1, max_attempts + 1):
             if self.cancelled(job_id):
                 self.update(job_id, status="cancelled", percent=100, text="任务已停止", error="任务已停止")
                 return
             current = dict(options)
             current["retry_wrapper"] = True
-            entry_pool = current["entry_proxies"]
-            exit_pool = current.get("exit_proxies") or entry_pool
-            pair = None
-            for _ in range(40):
-                if current.get("link_type") == "pix":
-                    proxy = secrets.choice(entry_pool)
-                    candidate = (proxy, proxy)
+            if current.get("dynamic_proxy_api"):
+                try:
+                    entry_country = str(
+                        current.get("entry_proxy_country") or current.get("country") or "US"
+                    ).upper()
+                    exit_country = str(
+                        current.get("exit_proxy_country") or current.get("country") or entry_country
+                    ).upper()
+                    proxy_session_time = int(current.get("proxy_session_time") or 10)
+                    entry_proxy = fetch_dynamic_attempt_proxy(entry_country, proxy_session_time)
+                    if current.get("link_type") in {"pix", "momo"}:
+                        exit_proxy = entry_proxy
+                    else:
+                        exit_proxy = fetch_dynamic_attempt_proxy(exit_country, proxy_session_time)
+                    pair = (entry_proxy, exit_proxy)
+                    current["entry_proxies"] = [entry_proxy]
+                    current["exit_proxies"] = [exit_proxy]
+                    self.log(
+                        job_id,
+                        f"Attempt {attempt}/{max_attempts}: proxy API issued fresh {entry_country}/{exit_country} routes",
+                    )
+                except Exception as exc:
+                    last_error = f"Dynamic proxy fetch failed: {type(exc).__name__}: {exc}"
+                    self.update(
+                        job_id,
+                        status="running" if attempt < max_attempts else "error",
+                        percent=4 if attempt < max_attempts else 100,
+                        text=("正在重新获取代理" if attempt < max_attempts else "任务失败"),
+                        error=last_error[:1200],
+                        last_retry_error=last_error[:500],
+                    )
+                    self.log(job_id, f"第 {attempt}/{max_attempts} 轮代理获取失败：{last_error[:260]}")
+                    if attempt >= max_attempts:
+                        return
+                    time.sleep(min(4, 1 + attempt * 0.35))
+                    continue
+            else:
+                entry_pool = current["entry_proxies"]
+                exit_pool = current.get("exit_proxies") or entry_pool
+                if current.get("paired_proxy_rotation"):
+                    entry_proxy = entry_pool[(attempt - 1) % len(entry_pool)]
+                    exit_proxy = entry_proxy if current.get("link_type") in {"pix", "momo"} else exit_pool[(attempt - 1) % len(exit_pool)]
+                    pair = (entry_proxy, exit_proxy)
                 else:
-                    candidate = (secrets.choice(entry_pool), secrets.choice(exit_pool))
-                if candidate not in used_pairs or len(used_pairs) >= len(entry_pool) * len(exit_pool):
-                    pair = candidate
-                    break
-            if pair is None:
-                pair = (secrets.choice(entry_pool), secrets.choice(exit_pool))
+                    pair = None
+                    for _ in range(40):
+                        if current.get("link_type") in {"pix", "momo"}:
+                            proxy = secrets.choice(entry_pool)
+                            candidate = (proxy, proxy)
+                        else:
+                            candidate = (secrets.choice(entry_pool), secrets.choice(exit_pool))
+                        if candidate not in used_pairs or len(used_pairs) >= len(entry_pool) * len(exit_pool):
+                            pair = candidate
+                            break
+                    if pair is None:
+                        pair = (secrets.choice(entry_pool), secrets.choice(exit_pool))
             used_pairs.add(pair)
             current["fixed_entry_proxy"], current["fixed_exit_proxy"] = pair
             if current.get("link_type") == "paypal":
@@ -1157,19 +1633,21 @@ class JobStore:
                 # attached.  This preserves the merchant's native zero-due
                 # PayPal SetupIntent configuration.  Strategy B keeps the
                 # existing cross-entry checkout/update flow as a fallback.
-                current["promo_on_create"] = bool((attempt - 1) % 2 == 0)
-            if current.get("link_type") in {"pix", "upi"}:
+                current["promo_on_create"] = bool(
+                    (attempt - 1) % 2 == 0 and not paypal_force_de_fallback
+                )
+            if current.get("link_type") in {"pix", "upi", "momo", "gcash"}:
                 # Alternate both Stripe submission shapes across outer retries.
                 # Some Checkout revisions accept a pre-created pm_* while
                 # others only complete the local mandate with inline data.
                 strategy_cycle = (
                     ("standalone", "late_promo", "inline")
                     if current.get("link_type") == "pix"
-                    else (
+                    else (("late_promo", "inline", "standalone") if current.get("link_type") == "momo" else (
                         ("go_b", "go_b", "inline", "late_promo")
                         if current.get("use_promo", False)
                         else ("standalone", "inline")
-                    )
+                    ))
                 )
                 current["local_method_strategy"] = strategy_cycle[(attempt - 1) % len(strategy_cycle)]
                 # Creating the Checkout at zero due removes PIX/UPI from this
@@ -1201,7 +1679,24 @@ class JobStore:
                     self._record_success(job_id, result)
                 return
             last_error = str(state.get("error") or "")
+            if last_error:
+                self.update(job_id, last_retry_error=last_error[:500])
             lowered = last_error.lower()
+            if "custom_checkout_rebuild_required" in lowered or "oaics_" in lowered:
+                oaics_hits += 1
+                self.log(job_id, f"OAICS Checkout 命中 {oaics_hits}/3；PayPal/本地支付将重建 Checkout")
+                if oaics_hits >= 3:
+                    threshold_error = (
+                        "OAICS_THRESHOLD_REACHED: selected payment channel requires Stripe cs_*; "
+                        "use Official Checkout for this account"
+                    )
+                    self.update(
+                        job_id, status="error", percent=100,
+                        text="当前账号仅返回 OAICS，请改用官方 Checkout",
+                        error=threshold_error,
+                        last_retry_error=last_error[:500],
+                    )
+                    return
             non_retryable = any(marker in lowered for marker in (
                 "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
                 "计划类型", "提取方式", "任务已停止",
@@ -1212,7 +1707,13 @@ class JobStore:
             if (
                 current.get("link_type") == "paypal"
                 and not paypal_force_de_fallback
-                and ("\u672a\u5f00\u653e paypal" in lowered or "\u672a\u5f00\u653epaypal" in lowered)
+                and (
+                    "\u672a\u5f00\u653e paypal" in lowered
+                    or "\u672a\u5f00\u653epaypal" in lowered
+                    or "does not expose paypal" in lowered
+                    or "paypal is not available" in lowered
+                    or "paypal unavailable" in lowered
+                )
                 and str(current.get("checkout_country") or current.get("country") or "").upper() != "DE"
             ):
                 paypal_force_de_fallback = True
@@ -1239,27 +1740,64 @@ class JobStore:
             country = str(options.get("checkout_country") or options.get("country") or "US").upper()
             payment_geo: dict[str, str] = {}
             if provider == "paypal":
-                exit_pool = list(options.get("exit_proxies") or [payment_proxy])
-                proxy_response = requests.post(
-                    f"{rust_base}/api/v1/proxies/select",
-                    json={
-                        "proxies": exit_pool,
-                        "preferred": payment_proxy,
-                        "scan_limit": int(os.getenv("PAYPAL_PROXY_SCAN_LIMIT", "24") or 24),
-                        "transport": str(os.getenv("PAY153_RUST_TRANSPORT") or "curl_cffi"),
-                    },
-                    timeout=90,
-                )
-                if proxy_response.status_code != 200:
-                    raise RuntimeError(
-                        f"Rust 代理选择失败 HTTP {proxy_response.status_code}: "
-                        f"{(proxy_response.text or '')[:500]}"
+                # reg153 prepares country-specific paired pools.  Re-probing as
+                # many as 24 entries for every batch task creates hundreds of
+                # simultaneous helper processes and used to surface as HTTP 408.
+                # Trust the requested checkout country for paired pools; public
+                # free-form pools still keep a bounded probe with a soft fallback.
+                if options.get("paired_proxy_rotation"):
+                    payment_geo = {
+                        "country": country,
+                        "currency": str(COUNTRY_CURRENCY.get(country) or options.get("checkout_currency") or options.get("currency") or ""),
+                        "region": "",
+                        "city": "",
+                        "postal": "",
+                        "timezone": "",
+                        "source": "paired_pool",
+                    }
+                    self.log(job_id, f"已使用配对代理池地区 {country}，跳过重复代理探测")
+                else:
+                    exit_pool = list(options.get("exit_proxies") or [payment_proxy])
+                    proxy_response = requests.post(
+                        f"{rust_base}/api/v1/proxies/select",
+                        json={
+                            "proxies": exit_pool,
+                            "preferred": payment_proxy,
+                            "scan_limit": min(8, max(1, int(os.getenv("PAYPAL_PROXY_SCAN_LIMIT", "6") or 6))),
+                            "transport": str(os.getenv("PAY153_RUST_TRANSPORT") or "curl_cffi"),
+                        },
+                        timeout=45,
                     )
-                proxy_selection = proxy_response.json() or {}
-                payment_proxy = str(proxy_selection.get("selected") or "").strip()
-                payment_geo = dict(proxy_selection.get("geo") or {})
-                if not payment_proxy or not payment_geo.get("country"):
-                    raise RuntimeError("Rust 代理选择未返回有效代理地区")
+                    if proxy_response.status_code == 200:
+                        proxy_selection = proxy_response.json() or {}
+                        payment_proxy = str(proxy_selection.get("selected") or payment_proxy).strip()
+                        payment_geo = dict(proxy_selection.get("geo") or {})
+                    elif proxy_response.status_code in {408, 429, 500, 502, 503, 504}:
+                        payment_geo = {
+                            "country": country,
+                            "currency": str(options.get("checkout_currency") or options.get("currency") or ""),
+                            "region": "",
+                            "city": "",
+                            "postal": "",
+                            "timezone": "",
+                            "source": "probe_timeout_fallback",
+                        }
+                        self.log(job_id, f"代理探测 HTTP {proxy_response.status_code}，沿用本轮固定代理继续")
+                    else:
+                        raise RuntimeError(
+                            f"Rust 代理选择失败 HTTP {proxy_response.status_code}: "
+                            f"{(proxy_response.text or '')[:500]}"
+                        )
+                    if not payment_proxy or not payment_geo.get("country"):
+                        payment_geo = {
+                            "country": country,
+                            "currency": str(options.get("checkout_currency") or options.get("currency") or ""),
+                            "region": "",
+                            "city": "",
+                            "postal": "",
+                            "timezone": "",
+                            "source": "empty_geo_fallback",
+                        }
                 payment_country = str(payment_geo.get("country") or country).upper()
                 detected_currency = str(payment_geo.get("currency") or "").upper()
                 if options.get("force_paypal_de_fallback"):
@@ -1276,6 +1814,10 @@ class JobStore:
                 country, options["currency"] = "NL", "EUR"
                 options["country"] = options["checkout_country"] = country
                 options["checkout_currency"] = "EUR"
+            elif provider == "twint":
+                country, options["currency"] = "CH", "CHF"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "CHF"
             elif provider == "upi":
                 country, options["currency"] = "IN", "INR"
                 options["country"] = options["checkout_country"] = country
@@ -1284,6 +1826,14 @@ class JobStore:
                 country, options["currency"] = "BR", "BRL"
                 options["country"] = options["checkout_country"] = country
                 options["checkout_currency"] = "BRL"
+            elif provider == "momo":
+                country, options["currency"] = "VN", "VND"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "VND"
+            elif provider == "gcash":
+                country, options["currency"] = "PH", "PHP"
+                options["country"] = options["checkout_country"] = country
+                options["checkout_currency"] = "PHP"
             elif provider == "kakao":
                 country, options["currency"] = "KR", "KRW"
                 options["country"] = options["checkout_country"] = country
@@ -1335,6 +1885,16 @@ class JobStore:
             billing = dict(((billing_response.json() or {}).get("profile") or {}).get("billing") or {})
             if not billing.get("address"):
                 raise RuntimeError("Rust 账单生成未返回地址")
+            if provider == "paypal" and country in ROTATING_PAYPAL_ADDRESS_COUNTRIES:
+                normalized_address = None
+                for _ in range(8):
+                    cached_address = resolve_cached_country_address(country)
+                    normalized_address = normalize_rotating_paypal_address(country, cached_address or {})
+                    if normalized_address:
+                        break
+                if normalized_address:
+                    address = billing.setdefault("address", {})
+                    address.update(normalized_address)
             if provider == "pix":
                 identity = dict(options.get("pix_identity") or {})
                 if identity:
@@ -1360,6 +1920,13 @@ class JobStore:
                 },
             }
             profile = sc._profile(country)
+            self.log(
+                job_id,
+                "令牌字段：SEN={}，SO={}".format(
+                    "ON" if options.get("use_sen", True) else "OFF",
+                    "ON" if options.get("use_so", True) else "OFF",
+                ),
+            )
             common = {
                 "access_token": token,
                 "account_id": str(meta.get("account_id") or ""),
@@ -1367,6 +1934,8 @@ class JobStore:
                 "billing": rust_billing,
                 "browser_locale": str(profile.get("browser_locale") or "en-US"),
                 "browser_timezone": str(profile.get("browser_timezone") or "America/Chicago"),
+                "use_sen": bool(options.get("use_sen", True)),
+                "use_so": bool(options.get("use_so", True)),
                 "attempts": [{
                     "chatgpt_proxy": payment_proxy,
                     "stripe_proxy": payment_proxy,
@@ -1420,6 +1989,8 @@ class JobStore:
                 "link_type": provider,
                 "country": country,
                 "currency": options.get("currency"),
+                "use_promo": bool(options.get("use_promo")),
+                "promo_campaign": str(options.get("promo_campaign") or ""),
             })
             step_labels = {
                 "creating_checkout": "创建 OpenAI Checkout",
@@ -1475,6 +2046,8 @@ class JobStore:
                         "entry_country": str(proxy_country(entry_proxy)[0] or "").upper(),
                         "payment_proxy_country": str(proxy_country(payment_proxy)[0] or "").upper(),
                         "rust_workflow": True,
+                        "sen_requested": bool(options.get("use_sen", True)),
+                        "so_requested": bool(options.get("use_so", True)),
                     })
                     if provider == "paypal":
                         result["paypal_link"] = result.get("paypal_url") or ""
@@ -1518,22 +2091,25 @@ class JobStore:
         rust_execute = str(os.getenv("PAY153_RUST_WORKFLOWS") or "").strip().lower() in {
             "1", "true", "yes", "on",
         }
-        if rust_execute and rust_base and options.get("link_type") in {"hosted", "paypal", "pix", "upi", "ideal", "kakao"}:
+        if rust_execute and rust_base and options.get("link_type") in {"paypal", "pix", "upi", "ideal", "kakao"} and not (
+            options.get("link_type") == "paypal" and options.get("oaics_paypal")
+        ):
             return self._run_rust_workflow(job_id, options, rust_base)
         try:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
-            token, meta = extract_access_token(options.pop("token_raw"))
+            raw_token = options.pop("token_raw")
+            token, meta = extract_access_token(raw_token)
             self.ensure_not_cancelled(job_id)
             provider = options["link_type"]
             country = options["country"]
             entry_pool = options["entry_proxies"]
-            exit_pool = entry_pool if provider == "pix" else (options.get("exit_proxies") or entry_pool)
+            exit_pool = entry_pool if provider in {"pix", "momo"} else (options.get("exit_proxies") or entry_pool)
             entry_proxy = options.get("fixed_entry_proxy") or secrets.choice(entry_pool)
-            exit_proxy = entry_proxy if provider == "pix" else (options.get("fixed_exit_proxy") or secrets.choice(exit_pool))
+            exit_proxy = entry_proxy if provider in {"pix", "momo"} else (options.get("fixed_exit_proxy") or secrets.choice(exit_pool))
             payment_geo: dict[str, str] = {}
             if provider == "hosted":
                 self.log(job_id, f"代理池共 {len(entry_pool)} 条，本次已自动选择 1 条")
-            elif provider == "pix":
+            elif provider in {"pix", "momo"}:
                 self.log(job_id, f"代理池 1 共 {len(entry_pool)} 条，本次已自动选择 1 条")
             else:
                 self.log(job_id, f"代理池 1 共 {len(entry_pool)} 条，代理池 2 共 {len(exit_pool)} 条，本次已分别自动选择")
@@ -1542,10 +2118,80 @@ class JobStore:
             # the same ids are kept for create -> update -> approve.
             device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
 
+            if provider == "ph_short":
+                short_country = country if country in {"PH", "GB", "US"} else "PH"
+                short_currency = {"PH": "PHP", "GB": "GBP", "US": "USD"}[short_country]
+                checkout_proxy_country = str(options.get("entry_proxy_country") or short_country).upper()
+                update_proxy_country = str(options.get("exit_proxy_country") or (options.get("promo_country") if options.get("use_promo") else short_country) or short_country).upper()
+                self.update(job_id, percent=9, text=f"Validate {checkout_proxy_country} Checkout and {update_proxy_country} promotion proxy")
+                credentials = parse_ph_short_credentials(raw_token)
+                extractor = PhShortCheckoutExtractor(
+                    credentials,
+                    PhShortExtractorConfig(
+                        billing_country=short_country,
+                        currency=short_currency,
+                        payment_locale="en",
+                        checkout_proxy_country=checkout_proxy_country,
+                        update_proxy_country=update_proxy_country,
+                        checkout_proxy=entry_proxy,
+                        update_proxy=exit_proxy,
+                        plan_name="chatgptplusplan",
+                        promo_campaign_id=options.get("promo_campaign") or "plus-1-month-free",
+                        apply_promo=bool(options.get("use_promo")),
+                        checkout_attempts=10,
+                        update_attempts=15,
+                        full_attempts=1,
+                        cf_same_identity_attempts=5,
+                        verify_proxy_country=True,
+                        allow_missing_customer_session=bool(options.get("allow_missing_customer_session")),
+                    ),
+                    logger=lambda message: self.log(job_id, message),
+                )
+                self.update(job_id, percent=24, text=f"Create {short_country}/{short_currency} Checkout")
+                extracted = extractor.extract()
+                verification = str(extracted.amount_verification or "pending")
+                promo_requested = bool(options.get("use_promo"))
+                promo_applied = (verification == "verified_zero") if promo_requested and verification != "pending" else None
+                result = {
+                    "plan": options["plan"],
+                    "link_type": "ph_short",
+                    "checkout_session_id": extracted.cs_id,
+                    "checkout_url": extracted.long_url,
+                    "short_link": extracted.long_url,
+                    "processor_entity": extracted.processor_entity,
+                    "account_email": meta.get("email") or "",
+                    "account_id": meta.get("account_id") or "",
+                    "country": short_country,
+                    "currency": short_currency,
+                    "checkout_country": short_country,
+                    "checkout_currency": short_currency,
+                    "entry_country": checkout_proxy_country,
+                    "payment_proxy_country": update_proxy_country,
+                    "proxy_mode": f"{checkout_proxy_country.lower()}_checkout_{update_proxy_country.lower()}_update",
+                    "entry_proxy_pool_size": len(entry_pool),
+                    "exit_proxy_pool_size": len(exit_pool),
+                    "promo_requested": promo_requested,
+                    "promo_applied": promo_applied,
+                    "promo_campaign_used": (options.get("promo_campaign") or "plus-1-month-free") if promo_requested else "",
+                    "amount_verification": verification,
+                    "checkout_amount": extracted.amount_minor,
+                    "amount_currency": extracted.amount_currency,
+                    "checkout_device_id": extracted.device_id,
+                    "checkout_chatgpt_session_id": extracted.chatgpt_session_id,
+                    "checkout_user_agent": extracted.user_agent,
+                    "stripe_publishable_key": extracted.publishable_key,
+                    "extractor": "simon_short_link",
+                }
+                done_text = "菲律宾短链生成完成"
+                if verification == "pending":
+                    done_text += "（金额待页面复核）"
+                self.update(job_id, percent=100, text=done_text, status="done", result=result)
+                return
+
             if provider == "pix":
                 self.update(job_id, percent=9, text="第 1/7 步：选择并检测代理")
-                main_country, main_region = proxy_country(entry_proxy)
-                stripe_country, stripe_region = proxy_country(exit_proxy)
+                main_country, main_region = proxy_country(entry_proxy, options.get("entry_proxy_country"))
+                stripe_country, stripe_region = proxy_country(exit_proxy, options.get("exit_proxy_country"))
                 self.log(job_id, f"PIX 代理校验：代理池 1={main_country}/{main_region}")
                 if main_country != "BR" or stripe_country != "BR":
                     self.log(
@@ -1553,8 +2199,25 @@ class JobStore:
                         f"PIX 当前代理为 {main_country or '?'} + {stripe_country or '?'}；不限制国家，继续由上游判断支付方式",
                     )
                 self.ensure_not_cancelled(job_id)
+            elif provider == "momo":
+                self.update(job_id, percent=9, text="第 1/7 步：选择并检测越南代理")
+                main_country, main_region = proxy_country(entry_proxy, options.get("entry_proxy_country"))
+                self.log(job_id, f"MoMo 代理校验：代理池 1={main_country}/{main_region}")
+                if main_country != "VN":
+                    self.log(job_id, f"MoMo 当前代理为 {main_country or '?'}；继续由上游判断支付方式")
+                country = options["country"] = options["checkout_country"] = "VN"
+                options["currency"] = options["checkout_currency"] = "VND"
+                self.ensure_not_cancelled(job_id)
 
             promo_requested = options["plan"] == "plus" and options.get("use_promo", False)
+            if provider == "gcash":
+                main_country, main_region = proxy_country(entry_proxy, options.get("entry_proxy_country"))
+                promo_proxy_country, promo_proxy_region = proxy_country(exit_proxy, options.get("exit_proxy_country"))
+                self.update(job_id, percent=9, text="校验 US Checkout 与优惠代理")
+                self.log(job_id, f"GCash 路由：Checkout={main_country}/{main_region}，账单=PH/PHP，优惠更新={promo_proxy_country}/{promo_proxy_region}")
+                if main_country != "US":
+                    self.log(job_id, f"GCash Checkout 代理当前为 {main_country or '?'}；目标为 US，继续由上游校验")
+                self.ensure_not_cancelled(job_id)
             if provider == "paypal":
                 self.update(job_id, percent=9, text="第 1/7 步：校验 PayPal 优惠识别代理与支付代理")
                 main_country, main_region = proxy_country(entry_proxy)
@@ -1594,8 +2257,8 @@ class JobStore:
                 self.ensure_not_cancelled(job_id)
             if provider == "upi":
                 self.update(job_id, percent=9, text="第 1/7 步：校验 UPI 优惠识别代理与印度支付代理")
-                main_country, main_region = proxy_country(entry_proxy)
-                payment_country, payment_region = proxy_country(exit_proxy)
+                main_country, main_region = proxy_country(entry_proxy, options.get("entry_proxy_country"))
+                payment_country, payment_region = proxy_country(exit_proxy, options.get("exit_proxy_country"))
                 self.log(job_id, f"UPI 代理校验：优惠识别={main_country}/{main_region}，UPI 支付={payment_country}/{payment_region}，账单=IN/INR")
                 if promo_requested and main_country not in {"TR", "JP"}:
                     self.log(job_id, f"UPI 优惠识别代理当前为 {main_country or '?'}；不限制国家，继续尝试")
@@ -1604,8 +2267,8 @@ class JobStore:
                 self.ensure_not_cancelled(job_id)
             if provider == "ideal":
                 self.update(job_id, percent=9, text="校验 iDEAL 荷兰支付代理")
-                main_country, main_region = proxy_country(entry_proxy)
-                payment_country, payment_region = proxy_country(exit_proxy)
+                main_country, main_region = proxy_country(entry_proxy, options.get("entry_proxy_country"))
+                payment_country, payment_region = proxy_country(exit_proxy, options.get("exit_proxy_country"))
                 self.log(
                     job_id,
                     f"iDEAL 代理校验：入口={main_country}/{main_region}，"
@@ -1616,11 +2279,20 @@ class JobStore:
                         f"iDEAL 支付代理出口为 {payment_country or '未知'}，需要 NL 荷兰出口"
                     )
                 self.ensure_not_cancelled(job_id)
+            if provider == "twint":
+                self.update(job_id, percent=9, text="校验 TWINT 瑞士支付代理")
+                payment_country, payment_region = proxy_country(exit_proxy, options.get("exit_proxy_country"))
+                self.log(job_id, f"TWINT 代理校验：支付={payment_country}/{payment_region}，账单=CH/CHF")
+                if payment_country != "CH":
+                    raise RuntimeError(f"TWINT 支付代理出口为 {payment_country or '未知'}，需要 CH 瑞士出口")
+                country = options["country"] = options["checkout_country"] = "CH"
+                options["currency"] = options["checkout_currency"] = "CHF"
+                self.ensure_not_cancelled(job_id)
             preflight = {}
             if promo_requested:
                 self.update(job_id, percent=12, text="读取入口支付与活动标记")
                 preflight = preflight_trial_eligibility(
-                    token, meta.get("account_id") or "", entry_proxy, device_id, did,
+                    token, meta.get("account_id") or "", (exit_proxy if provider == "gcash" else entry_proxy), device_id, did,
                     lambda m: self.log(job_id, m),
                 )
                 detected_campaign = promo_campaign_from_payload(preflight)
@@ -1694,26 +2366,41 @@ class JobStore:
                 (f"第 2/7 步：使用 {country} 代理创建 PayPal Checkout"
                  + ("（原生携带优惠）" if options.get("promo_on_create") else "（稍后更新优惠）"))
                 if provider == "paypal" and promo_requested else (
-                    "第 2/7 步：使用 IN 代理创建 UPI Checkout" if provider == "upi" else "创建 OpenAI Checkout"
+                    "第 2/7 步：使用 IN 代理创建 UPI Checkout" if provider == "upi" else (
+                        "第 2/7 步：使用 VN 代理创建 MoMo Checkout" if provider == "momo" else "创建 OpenAI Checkout"
+                    )
                 )
             )
             self.update(job_id, percent=34, text=stage2_text)
-            checkout_proxy = exit_proxy if provider in {"paypal", "upi", "ideal"} else entry_proxy
-            if provider == "pix":
+            checkout_proxy = exit_proxy if provider in {"paypal", "upi", "ideal", "twint"} else entry_proxy
+            if provider in {"pix", "momo"}:
                 self.log(
                     job_id,
-                    "Stage1 Checkout、优惠更新、Stripe 和 approval 使用同一条 BR 代理"
+                    f"Stage1 Checkout、优惠更新、Stripe 和 approval 使用同一条 {'BR' if provider == 'pix' else 'VN'} 代理"
                     + ("；本轮优惠随 Checkout 创建" if options.get("promo_on_create") else ""),
                 )
+            elif provider == "gcash":
+                self.log(job_id, f"GCash 设置：代理池 1 使用 US 创建 PH/PHP Checkout，代理池 2 使用用户选择的 {options.get('promo_country') or '优惠国家'} 更新优惠")
             elif provider == "paypal" and promo_requested:
                 self.log(job_id, f"PayPal 设置：代理池 1 用于优惠检查，代理池 2 创建 {country}/{options['currency']} Checkout")
             elif provider == "upi":
                 self.log(job_id, "UPI 设置：代理池 1 用于优惠检查，代理池 2 创建 IN/INR Checkout")
             elif provider == "ideal":
                 self.log(job_id, "iDEAL 设置：代理池 2 创建 NL/EUR Checkout，并贯穿 Stripe 支付处理")
+            elif provider == "twint":
+                self.log(job_id, "TWINT 设置：代理池 2 使用 CH 创建 CHF Checkout；可在支付方式确认后应用首月优惠")
             elif provider != "hosted":
                 self.log(job_id, f"Checkout 将使用所选的 {country} 地区代理")
-            created = create_checkout(token, payload, checkout_proxy, device_id, did, lambda m: self.log(job_id, m))
+            created = create_checkout(
+                token,
+                payload,
+                checkout_proxy,
+                device_id,
+                did,
+                lambda m: self.log(job_id, m),
+                use_sen=(True if provider == "gcash" else bool(options.get("use_sen", True))),
+                use_so=(True if provider == "gcash" else bool(options.get("use_so", True))),
+            )
             self.ensure_not_cancelled(job_id)
             self.update(job_id, percent=44, text="Checkout 创建完成，正在准备支付方式")
             checkout_data = created["data"]
@@ -1727,21 +2414,29 @@ class JobStore:
                 self.log(job_id, f"Checkout 已返回活动标识：{stage1_campaign}")
             provider_chatgpt_http = chatgpt_http
             promo_chatgpt_http = chatgpt_http
-            if provider in {"paypal", "upi", "ideal"}:
-                promo_chatgpt_http = sc.build_http(entry_proxy)
+            if provider in {"paypal", "upi", "ideal", "twint", "gcash"}:
+                promo_chatgpt_http = sc.build_http(exit_proxy if provider == "gcash" else entry_proxy)
                 try:
                     promo_chatgpt_http.cookies.set("oai-did", did, domain="chatgpt.com")
                     for cookie_name, cookie_value in chatgpt_http.cookies.get_dict().items():
                         promo_chatgpt_http.cookies.set(cookie_name, cookie_value, domain="chatgpt.com")
-                    promo_chatgpt_http.get("https://chatgpt.com/", headers={"User-Agent": sc.CHROME_UA}, timeout=25)
+                    promo_chatgpt_http.get(
+                        "https://chatgpt.com/api/auth/csrf",
+                        headers={"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+                        timeout=20,
+                    )
                 except Exception as exc:
                     self.log(job_id, f"{provider.upper()} 优惠线路暖身提示：{type(exc).__name__}")
-                if provider == "paypal":
+                if provider == "gcash":
+                    self.log(job_id, f"GCash 优惠更新使用代理池 2（{options.get('promo_country') or '用户选择地区'}），Checkout 与确认使用代理池 1（US）")
+                elif provider == "paypal":
                     self.log(job_id, f"PayPal 支付处理使用代理池 2（{country}）")
                 elif provider == "upi":
                     self.log(job_id, "UPI 支付处理使用代理池 2（IN）")
-                else:
+                elif provider == "ideal":
                     self.log(job_id, "iDEAL 优惠更新使用代理池 1，NL/EUR Checkout 与 Stripe 使用代理池 2")
+                else:
+                    self.log(job_id, "TWINT 支付处理使用代理池 2（CH/CHF）")
             session_id = checkout_data.get("checkout_session_id") or ""
             if not session_id and provider != "hosted":
                 raise RuntimeError("Checkout 未返回 Stripe Session ID")
@@ -1760,8 +2455,8 @@ class JobStore:
                 "checkout_country": options.get("checkout_country") or country,
                 "checkout_currency": options.get("checkout_currency") or options["currency"],
                 "entry_proxy_pool_size": len(entry_pool),
-                "exit_proxy_pool_size": len(exit_pool) if provider not in {"hosted", "pix"} else 0,
-                "proxy_mode": "single_chain" if provider == "pix" else ("entry_only" if provider == "hosted" else "dual_chain"),
+                "exit_proxy_pool_size": len(exit_pool) if provider not in {"hosted", "pix", "momo"} else 0,
+                "proxy_mode": ("us_checkout_promo_update" if provider == "gcash" else ("single_chain" if provider in {"pix", "momo"} else ("entry_only" if provider == "hosted" else "dual_chain"))),
                 "promo_requested": promo_requested,
                 "promo_applied": None,
                 "promo_campaign_used": options.get("promo_campaign") or "plus-1-month-free",
@@ -1771,6 +2466,7 @@ class JobStore:
                 "checkout_one_click_marker": checkout_data.get("one_click_trial_eligible"),
                 "promotion_eligibility_decided_by": "checkout_approve",
                 "entry_country": str(locals().get("main_country") or "").upper(),
+                "promo_country": str(options.get("promo_country") or "").upper(),
                 "payment_proxy_country": str(options.get("payment_proxy_country") or locals().get("payment_country") or "").upper(),
             }
             if promo_requested:
@@ -1786,6 +2482,310 @@ class JobStore:
                         job_id,
                         "Stage1 one_click 标记为 false；该字段不代表活动资格，继续以金额与 approval 结果判定",
                     )
+            if str(session_id).startswith("oaics_"):
+                custom_processor = (
+                    str(checkout_data.get("processor_entity") or "").strip()
+                    or ("openai_llc" if country == "US" else "openai_ie")
+                )
+                if provider == "gcash":
+                    self.update(job_id, percent=58, text="正在读取 GCash 自定义支付方式")
+                    custom_state = fetch_custom_checkout_session(
+                        chatgpt_http, token, session_id, custom_processor, device_id,
+                    )
+                    initial_custom_methods = custom_state.get("custom_payment_methods") or []
+                    initial_custom_method_id = next(
+                        (str(item.get("id") or "") for item in initial_custom_methods
+                         if str(item.get("id") or "").startswith("cpmt_")), "",
+                    )
+                    # OAICS can publish custom methods a moment after the checkout
+                    # object itself becomes readable. Poll briefly before rebuilding.
+                    for method_poll in range(1, 4):
+                        if initial_custom_method_id:
+                            break
+                        time.sleep(0.8 * method_poll)
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                        initial_custom_methods = custom_state.get("custom_payment_methods") or []
+                        initial_custom_method_id = next(
+                            (str(item.get("id") or "") for item in initial_custom_methods
+                             if str(item.get("id") or "").startswith("cpmt_")), "",
+                        )
+                        method_state = "已获取" if initial_custom_method_id else "待同步"
+                        self.log(job_id, f"GCash 支付方式同步检查 {method_poll}/3：{method_state}")
+                    custom_amount = custom_checkout_amount_minor(custom_state)
+                    custom_currency = custom_checkout_currency(custom_state) or "PHP"
+                    if promo_requested and custom_amount not in {None, 0}:
+                        self.update(job_id, percent=66, text="正在应用优惠并刷新 GCash Checkout")
+                        update_checkout_promo(
+                            promo_chatgpt_http, token, session_id, custom_processor,
+                            options.get("promo_campaign") or "plus-1-month-free",
+                            lambda m: self.log(job_id, m), device_id=device_id,
+                        )
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                        custom_amount = custom_checkout_amount_minor(custom_state)
+                        custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    gcash_billing = default_billing("PH", meta.get("email") or "", real_random=True)
+                    gcash_address = gcash_billing.get("address") or {}
+                    self.update(job_id, percent=72, text="正在提交 PH 账单地址")
+                    self.log(
+                        job_id,
+                        "GCash PH 账单：name={}，city={}，state={}，postal={}，source={}，place={}".format(
+                            gcash_billing.get("name") or "-",
+                            gcash_address.get("city") or "-",
+                            gcash_address.get("state") or "-",
+                            gcash_address.get("postal_code") or "-",
+                            gcash_billing.get("_address_source") or "fallback",
+                            gcash_billing.get("_place_name") or "-",
+                        ),
+                    )
+                    tax_checkout = submit_custom_checkout_taxes(
+                        chatgpt_http, token, session_id, custom_processor,
+                        gcash_billing, custom_currency, device_id,
+                    )
+                    if tax_checkout:
+                        custom_state = tax_checkout
+                    else:
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                    custom_amount = custom_checkout_amount_minor(custom_state)
+                    custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    custom_methods = custom_state.get("custom_payment_methods") or []
+                    custom_method_id = next(
+                        (str(item.get("id") or "") for item in custom_methods
+                         if str(item.get("id") or "").startswith("cpmt_")),
+                        initial_custom_method_id,
+                    )
+                    if not custom_method_id:
+                        raise RuntimeError("GCASH_METHOD_UNAVAILABLE: 当前 PH Checkout 尚未返回 GCash 支付方式，将更换代理重建")
+                    self.update(job_id, percent=76, text="正在确认 GCash 支付方式")
+                    try:
+                        confirmed = confirm_custom_checkout_method(
+                            chatgpt_http, token, session_id, custom_processor,
+                            custom_method_id, entry_proxy, device_id, did,
+                            use_sen=True, use_so=True, method_name="GCash",
+                        )
+                    except RuntimeError as confirm_error:
+                        if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
+                            raise
+                        self.log(job_id, "GCash confirm 首次被拦截，正在更新 SEN/SO 后重试")
+                        time.sleep(1.2)
+                        confirmed = confirm_custom_checkout_method(
+                            chatgpt_http, token, session_id, custom_processor,
+                            custom_method_id, entry_proxy, device_id, did,
+                            use_sen=True, use_so=True, method_name="GCash",
+                        )
+                    self.update(job_id, percent=88, text="正在生成 GCash 跳转链接")
+                    started = start_custom_checkout_method(
+                        chatgpt_http, token, session_id, custom_processor,
+                        custom_method_id, device_id,
+                    )
+                    action = started.get("next_action") or {}
+                    redirect_url = str(action.get("url") or "").strip()
+                    result.update({
+                        "link_type": "gcash",
+                        "checkout_provider": "open_ai",
+                        "processor_entity": custom_processor,
+                        "custom_payment_method_id": custom_method_id,
+                        "payment_method_type": str(action.get("paymentMethodType") or "gcash"),
+                        "provider_redirect_url": redirect_url,
+                        "short_link": redirect_url,
+                        "checkout_url": redirect_url,
+                        "verification_url": str(confirmed.get("confirm_return_url") or ""),
+                        "checkout_amount": custom_amount,
+                        "amount_currency": custom_currency,
+                        "amount_verification": (
+                            "verified_zero" if custom_amount == 0
+                            else ("pending" if custom_amount is None else "nonzero")
+                        ),
+                        "promo_applied": (
+                            (custom_amount == 0)
+                            if promo_requested and custom_amount is not None else None
+                        ),
+                        "expires_at": int(time.time()) + 1800,
+                    })
+                    if promo_requested and custom_amount not in {None, 0}:
+                        raise RuntimeError(
+                            f"GCash 优惠未生效：今日应付 amount={custom_amount} {custom_currency}"
+                        )
+                    self.update(job_id, percent=100, text="GCash 跳转链接生成完成", status="done", result=result)
+                    return
+                if provider == "paypal":
+                    self.update(job_id, percent=58, text="正在读取 OAICS PayPal 支付方式")
+                    custom_state = fetch_custom_checkout_session(
+                        chatgpt_http, token, session_id, custom_processor, device_id,
+                    )
+                    initial_methods = custom_state.get("custom_payment_methods") or []
+                    custom_amount = custom_checkout_amount_minor(custom_state)
+                    custom_currency = custom_checkout_currency(custom_state) or options["currency"]
+                    if promo_requested and custom_amount not in {None, 0}:
+                        self.update(job_id, percent=66, text="正在为 OAICS PayPal 应用优惠")
+                        update_checkout_promo(
+                            promo_chatgpt_http, token, session_id, custom_processor,
+                            options.get("promo_campaign") or "plus-1-month-free",
+                            lambda m: self.log(job_id, m), device_id=device_id,
+                        )
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                        custom_amount = custom_checkout_amount_minor(custom_state)
+                        custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    paypal_billing = default_billing(
+                        country, meta.get("email") or "", geo=payment_geo,
+                        real_random=(country in ROTATING_PAYPAL_ADDRESS_COUNTRIES),
+                    )
+                    self.update(job_id, percent=72, text="正在提交 OAICS PayPal 账单")
+                    tax_checkout = submit_custom_checkout_taxes(
+                        chatgpt_http, token, session_id, custom_processor,
+                        paypal_billing, custom_currency, device_id,
+                    )
+                    if tax_checkout:
+                        custom_state = tax_checkout
+                    else:
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                    custom_amount = custom_checkout_amount_minor(custom_state)
+                    custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    methods = list(custom_state.get("custom_payment_methods") or [])
+                    if not methods:
+                        methods = list(initial_methods)
+                    methods = [item for item in methods if str((item or {}).get("id") or "").startswith("cpmt_")]
+                    methods.sort(key=lambda item: 0 if "paypal" in json.dumps(item, ensure_ascii=False).lower() else 1)
+                    if not methods:
+                        raise RuntimeError("OAICS_PAYPAL_METHOD_UNAVAILABLE: OAICS Checkout 未返回 PayPal 自定义支付方式")
+                    selected_method_id = ""
+                    confirmed = {}
+                    started = {}
+                    redirect_url = ""
+                    for method in methods:
+                        method_id = str(method.get("id") or "")
+                        try:
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                method_id, exit_proxy, device_id, did,
+                                use_sen=bool(options.get("use_sen", True)),
+                                use_so=bool(options.get("use_so", True)),
+                                method_name="PayPal",
+                            )
+                        except RuntimeError as confirm_error:
+                            if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
+                                raise
+                            self.log(job_id, "OAICS PayPal confirm 首次被拦截，更新 SEN/SO 后重试")
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                method_id, exit_proxy, device_id, did,
+                                use_sen=True, use_so=True, method_name="PayPal",
+                            )
+                        started = start_custom_checkout_method(
+                            chatgpt_http, token, session_id, custom_processor,
+                            method_id, device_id,
+                        )
+                        action = started.get("next_action") or {}
+                        candidate_url = str(action.get("url") or "").strip()
+                        candidate_type = str(action.get("paymentMethodType") or "").lower()
+                        if "paypal" in candidate_type or "paypal" in candidate_url.lower():
+                            selected_method_id = method_id
+                            redirect_url = candidate_url
+                            break
+                        self.log(job_id, f"OAICS 自定义支付 {method_id[:12]} 不是 PayPal，继续检查")
+                    if not redirect_url:
+                        raise RuntimeError("OAICS_PAYPAL_REDIRECT_MISSING: 自定义支付方式未返回 PayPal 跳转")
+                    result.update({
+                        "link_type": "paypal",
+                        "checkout_provider": "open_ai_oaics",
+                        "processor_entity": custom_processor,
+                        "custom_payment_method_id": selected_method_id,
+                        "payment_method_type": "paypal",
+                        "paypal_link": redirect_url,
+                        "provider_redirect_url": redirect_url,
+                        "short_link": redirect_url,
+                        "checkout_url": redirect_url,
+                        "verification_url": str(confirmed.get("confirm_return_url") or ""),
+                        "checkout_amount": custom_amount,
+                        "amount_currency": custom_currency,
+                        "amount_verification": "verified_zero" if custom_amount == 0 else ("pending" if custom_amount is None else "nonzero"),
+                        "promo_applied": ((custom_amount == 0) if promo_requested and custom_amount is not None else None),
+                        "oaics_paypal": True,
+                        "expires_at": int(time.time()) + 1800,
+                    })
+                    if promo_requested and custom_amount not in {None, 0}:
+                        raise RuntimeError(f"OAICS PayPal 优惠未生效：amount={custom_amount} {custom_currency}")
+                    self.update(job_id, percent=100, text="OAICS PayPal 跳转链接生成完成", status="done", result=result)
+                    return
+                if provider != "hosted":
+                    raise RuntimeError(
+                        f"CUSTOM_CHECKOUT_REBUILD_REQUIRED: received {session_id}; "
+                        f"{provider} requires a Stripe cs_* checkout"
+                    )
+                custom_processor = (
+                    str(checkout_data.get("processor_entity") or "").strip()
+                    or ("openai_llc" if country == "US" else "openai_ie")
+                )
+                custom_url = (
+                    str(checkout_data.get("checkout_url") or "").strip()
+                    or f"https://chatgpt.com/checkout/{custom_processor}/{session_id}"
+                )
+                custom_update: dict[str, Any] = {}
+                if promo_requested:
+                    self.update(job_id, percent=68, text="正在为 OAICS Checkout 应用优惠")
+                    custom_update = update_checkout_promo(
+                        promo_chatgpt_http,
+                        token,
+                        session_id,
+                        custom_processor,
+                        options.get("promo_campaign") or "plus-1-month-free",
+                        lambda m: self.log(job_id, m),
+                        device_id=device_id,
+                    )
+                custom_amount = custom_checkout_amount_minor(custom_update)
+                custom_currency = custom_checkout_currency(custom_update) or options["currency"]
+                if custom_amount is None:
+                    try:
+                        custom_page = chatgpt_http.get(
+                            custom_url,
+                            headers={
+                                "Authorization": f"Bearer {token}",
+                                "User-Agent": sc.CHROME_UA,
+                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                "Referer": "https://chatgpt.com/",
+                            },
+                            timeout=35,
+                        )
+                        custom_state = custom_checkout_state_from_html(custom_page.text or "")
+                        custom_amount = custom_checkout_amount_minor(custom_state)
+                        custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    except Exception as exc:
+                        self.log(job_id, f"OAICS 金额页面读取提示：{type(exc).__name__}")
+                custom_verification = (
+                    "verified_zero" if custom_amount == 0
+                    else ("pending" if custom_amount is None else "nonzero")
+                )
+                result.update({
+                    "requested_link_type": str(options.get("requested_link_type") or provider),
+                    "link_type": "oaics",
+                    "checkout_provider": "open_ai",
+                    "checkout_url": custom_url,
+                    "short_link": custom_url,
+                    "processor_entity": custom_processor,
+                    "checkout_ui_mode": "custom",
+                    "checkout_amount": custom_amount,
+                    "amount_currency": custom_currency,
+                    "amount_verification": custom_verification,
+                    "promo_applied": (custom_amount == 0) if promo_requested and custom_amount is not None else None,
+                })
+                if promo_requested and custom_amount not in {None, 0}:
+                    raise RuntimeError(
+                        f"OAICS 优惠未生效：今日应付 amount={custom_amount} {custom_currency}"
+                    )
+                done_text = "OAICS Checkout 提链完成"
+                if custom_amount is None:
+                    done_text += "（金额待页面复核）"
+                self.update(job_id, percent=100, text=done_text, status="done", result=result)
+                return
             if provider == "hosted":
                 self.update(job_id, percent=56, text="正在检测官方长链金额")
                 if not session_id:
@@ -1799,14 +2799,34 @@ class JobStore:
                 hosted_pk = str(checkout_data.get("publishable_key") or "") or sc.verify_pk(
                     hosted_stripe_http, session_id, lambda m: self.log(job_id, m)
                 )
+                hosted_customer_session = str(
+                    checkout_data.get("customer_session_client_secret") or ""
+                ).strip()
+                if hosted_customer_session.startswith("cuss_secret_"):
+                    sc.CHECKOUT_CUSTOMER_SESSION_SECRETS[session_id] = hosted_customer_session
+                    self.log(job_id, "???? CustomerSession ???")
                 hosted_init, hosted_version, hosted_ctx = sc.init_checkout(
                     hosted_stripe_http, session_id, hosted_pk, hosted_profile, lambda m: self.log(job_id, m)
+                )
+                exact_hosted_url = normalize_hosted_checkout_url(
+                    hosted_ctx.get("stripe_hosted_url") or "", session_id
                 )
                 hosted_processor = (
                     str(checkout_data.get("processor_entity") or "")
                     or sc._entity_from_return_url(hosted_ctx.get("return_url") or hosted_init.get("return_url") or "")
                     or "openai_llc"
                 )
+                if not exact_hosted_url or "#" not in exact_hosted_url:
+                    raise RuntimeError("Stripe did not return a complete Hosted Checkout URL")
+                source_hosted_url = str(checkout_data.get("checkout_url") or "").strip()
+                if session_id in source_hosted_url and "#" in source_hosted_url:
+                    result["checkout_url"] = source_hosted_url
+                else:
+                    result["checkout_url"] = exact_hosted_url
+                result["stripe_hosted_url"] = exact_hosted_url
+                if options["plan"] == "codex_low":
+                    result["short_link"] = ""
+                    result["checkout_ui_mode"] = "hosted"
                 hosted_amount = hosted_ctx.get("checkout_amount")
                 try:
                     hosted_zero = int(str(hosted_amount)) == 0
@@ -1837,6 +2857,30 @@ class JobStore:
                             hosted_zero = str(hosted_amount).strip() in {"0", "0.0", "0.00"}
                         if hosted_zero:
                             break
+
+                hosted_elements = sc.fetch_elements_session(
+                    hosted_stripe_http,
+                    hosted_pk,
+                    session_id,
+                    hosted_ctx,
+                    hosted_version,
+                    hosted_profile,
+                    lambda m: self.log(job_id, m),
+                )
+
+                # Keep saved-card availability for the UI, without enforcing
+                # or exposing the saved card billing country.
+                saved_method_count = 0
+                for saved_source in (hosted_init, hosted_elements):
+                    if not isinstance(saved_source, dict):
+                        continue
+                    saved_customer = saved_source.get("customer") or saved_source.get("legacy_customer") or {}
+                    if not isinstance(saved_customer, dict):
+                        continue
+                    saved_methods = saved_customer.get("payment_methods") or []
+                    if isinstance(saved_methods, list):
+                        saved_method_count = max(saved_method_count, len(saved_methods))
+                result["saved_payment_method_count"] = saved_method_count
 
                 hosted_billing = default_billing(country, meta.get("email") or "")
                 sc.update_tax_region(
@@ -1990,8 +3034,12 @@ class JobStore:
                     self.log(job_id, "PayPal 已确认可用，正在应用优惠")
                 elif provider == "upi":
                     self.log(job_id, "UPI 已确认可用，正在应用优惠")
+                elif provider == "momo":
+                    self.log(job_id, "MoMo 已确认可用，正在应用优惠")
                 elif provider == "ideal":
                     self.log(job_id, "iDEAL 已确认可用，正在通过代理池 1 提交优惠；最终以 Stripe 今日应付金额为准")
+                elif provider == "twint":
+                    self.log(job_id, "TWINT 已确认可用，正在应用首月优惠并校验 CHF 今日应付金额")
                 advance_progress(70, "正在应用优惠")
                 campaign = options.get("promo_campaign") or "plus-1-month-free"
                 response = update_checkout_promo(
@@ -2024,7 +3072,7 @@ class JobStore:
                 # 卡住时，额外 Sentinel 上下文会让批准结果与 Stripe
                 # submission 不同步。
                 approve_callback=None if provider == "paypal" else approve_cb,
-                apply_promo_callback=apply_promo_cb if provider in {"pix", "paypal", "upi", "ideal"} and promo_requested else None,
+                apply_promo_callback=apply_promo_cb if provider in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"} and promo_requested else None,
                 ideal_bank=options.get("ideal_bank", ""),
                 require_zero_due=promo_requested,
                 local_method_strategy=options.get("local_method_strategy") or "standalone",
@@ -2040,7 +3088,9 @@ class JobStore:
                 result["currency"] = str(provider_result["checkout_currency"]).upper()
                 result["checkout_currency"] = result["currency"]
             done_text = "第 7/7 步：PIX 二维码生成完成" if provider == "pix" else (
+                "第 7/7 步：MoMo 支付结果生成完成" if provider == "momo" else (
                 "第 7/7 步：PayPal agreements/approve 链接生成完成" if provider == "paypal" else f"{provider.upper()} 提取完成"
+                )
             )
             self.update(job_id, percent=100, text=done_text, status="done", result=result)
         except InterruptedError as exc:
@@ -2149,176 +3199,6 @@ def private_checkout_page():
     return send_from_directory(app.static_folder, "index.html")
 
 
-@app.get("/grok-trial")
-@app.get("/grok-trial/")
-def grok_trial_page():
-    # Hidden tool page: intentionally omitted from the public navigation.
-    return send_from_directory(app.static_folder, "grok-trial.html")
-
-
-@app.get("/api/grok-trial/status")
-def grok_trial_status():
-    return jsonify({"ok": True, **grok_pool_summary()})
-
-
-@app.post("/api/grok-trial/extract")
-def grok_trial_extract():
-    client_ip = request_client_ip()
-    allowed, retry_after = IP_TASK_LIMITER.acquire(client_ip)
-    if not allowed:
-        response = jsonify({
-            "ok": False,
-            "error": f"当前 IP 每分钟最多创建 {IP_TASK_LIMITER.limit} 个任务，请在 {retry_after} 秒后重试。",
-            "retry_after": retry_after,
-        })
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
-    data = request.get_json(silent=True) or {}
-    try:
-        result = generate_trial_link(
-            str(data.get("account_id") or ""),
-            str(data.get("region") or "US"),
-        )
-        supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
-        expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
-        if supplied and hmac.compare_digest(supplied, expected):
-            result["credentials"] = grok_account_credentials(result["account_id"])
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)[:800]}), 502
-
-
-@app.post("/api/grok-trial/verify")
-def grok_trial_verify():
-    data = request.get_json(silent=True) or {}
-    account_id = str(data.get("account_id") or "").strip()
-    if not account_id:
-        return jsonify({"ok": False, "error": "缺少 Grok 账号 ID"}), 400
-    try:
-        result = grok_verify_subscription(
-            account_id,
-            str(data.get("region") or "US"),
-            hard_sync=True,
-        )
-        supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
-        expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
-        if supplied and hmac.compare_digest(supplied, expected):
-            result["credentials"] = grok_account_credentials(account_id)
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)[:800]}), 502
-
-
-@app.post("/api/grok-trial/braintree-session")
-def grok_trial_braintree_session():
-    data = request.get_json(silent=True) or {}
-    supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
-    expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        return jsonify({"ok": False, "error": "Braintree 私有功能令牌校验失败"}), 403
-    try:
-        result = grok_create_braintree_session(
-            str(data.get("account_id") or "").strip(),
-            str(data.get("region") or "US"),
-        )
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)[:800]}), 400
-
-
-@app.post("/api/grok-trial/braintree-link")
-def grok_trial_braintree_link():
-    data = request.get_json(silent=True) or {}
-    account_id = str(data.get("account_id") or "").strip()
-    proxy_override = str(data.get("proxy") or "").strip()
-    supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
-    expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        return jsonify({"ok": False, "error": "Braintree 私有功能令牌校验失败"}), 403
-    if not proxy_override:
-        return jsonify({"ok": False, "error": "请填写与账单国家一致的协议生成代理"}), 400
-    try:
-        result = grok_create_braintree_agreement_link(
-            account_id=account_id,
-            region=str(data.get("region") or "US"),
-            proxy_override=proxy_override,
-        )
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)[:1000]}), 400
-
-
-@app.post("/api/grok-trial/braintree-subscribe")
-def grok_trial_braintree_subscribe():
-    data = request.get_json(silent=True) or {}
-    supplied = str(request.headers.get("X-Grok-Access-Token") or data.get("access_token") or "")
-    expected = str(os.getenv("GROK_TRIAL_ACCESS_TOKEN", "1537271403"))
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        return jsonify({"ok": False, "error": "Braintree 私有功能令牌校验失败"}), 403
-    account_id = str(data.get("account_id") or "").strip()
-    nonce = str(data.get("nonce") or "").strip()
-    if not account_id or not nonce:
-        return jsonify({"ok": False, "error": "缺少 Grok 账号或 Braintree nonce"}), 400
-    try:
-        result = grok_subscribe_via_braintree(
-            account_id=account_id,
-            nonce=nonce,
-            region=str(data.get("region") or "US"),
-            plan_id=str(data.get("plan_id") or "supergrok_monthly"),
-            campaign_id=str(data.get("campaign_id") or ""),
-        )
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        app.logger.warning("Braintree card subscription failed: %s", str(exc)[:1000])
-        return jsonify({"ok": False, "error": str(exc)[:1000]}), 422
-
-
-@app.post("/api/grok-trial/braintree-complete")
-def grok_trial_braintree_complete():
-    data = request.get_json(silent=True) or {}
-    account_id = str(data.get("account_id") or "").strip()
-    billing_token = str(data.get("billing_token") or "").strip()
-    payer_id = str(data.get("payer_id") or "").strip()
-    if not account_id or not billing_token or not payer_id:
-        return jsonify({"ok": False, "error": "缺少 Grok 账号、Billing Token 或 Payer ID"}), 400
-    try:
-        result = grok_complete_braintree_paypal_approval(
-            account_id=account_id,
-            billing_token=billing_token,
-            payer_id=payer_id,
-            region=str(data.get("region") or "US"),
-            plan_id=str(data.get("plan_id") or "supergrok_monthly"),
-            campaign_id=str(data.get("campaign_id") or ""),
-            proxy_override=str(data.get("proxy") or ""),
-        )
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)[:1200]}), 502
-
-
-@app.post("/api/grok-trial/braintree-register")
-def grok_trial_braintree_register():
-    data = request.get_json(silent=True) or {}
-    try:
-        result = grok_register_braintree_agreement(
-            account_id=str(data.get("account_id") or ""),
-            billing_token=str(data.get("billing_token") or ""),
-            region=str(data.get("region") or "US"),
-            plan_id=str(data.get("plan_id") or "supergrok_monthly"),
-            campaign_id=str(data.get("campaign_id") or ""),
-        )
-        return jsonify({"ok": True, "result": result})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)[:800]}), 400
-
-
-@app.post("/api/grok-trial/braintree-context")
-def grok_trial_braintree_context():
-    data = request.get_json(silent=True) or {}
-    result = grok_resolve_braintree_agreement(str(data.get("billing_token") or ""))
-    return jsonify({"ok": True, "result": result})
-
-
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "pay153", "time": int(time.time())})
@@ -2328,15 +3208,15 @@ def health():
 def config():
     return jsonify({
         "plans": list(PLANS),
-        "link_types": ["hosted", "paypal", "ideal", "pix", "kakao"]
+        "link_types": ["hosted", "ph_short", "paypal", "ideal", "twint", "pix", "momo", "gcash", "kakao"]
             + (["upi"] if UPI_ENABLED else []),
         "disabled_link_types": [] if UPI_ENABLED else ["upi"],
         "country_currency": COUNTRY_CURRENCY,
         "provider_defaults": PROVIDER_DEFAULTS,
         "proxy_policy": {
             "entry_required": True,
-            "exit_required_for": ["paypal", "ideal", "upi", "kakao"],
-            "single_chain_for": ["pix"],
+            "exit_required_for": ["ph_short", "paypal", "ideal", "twint", "upi", "gcash", "kakao"],
+            "single_chain_for": ["pix", "momo"],
             "max_per_pool": 500,
             "selection": "random_per_job",
         },
@@ -2362,13 +3242,20 @@ def start_checkout():
     link_type = str(data.get("link_type") or "hosted").lower()
     if plan not in PLANS:
         return jsonify({"error": "计划类型不正确"}), 400
-    if link_type not in {"hosted", "paypal", "ideal", "upi", "pix", "kakao"}:
+    if link_type not in {"hosted", "ph_short", "paypal", "ideal", "twint", "upi", "pix", "momo", "gcash", "kakao"}:
         return jsonify({"error": "提取方式不正确"}), 400
     if link_type == "upi" and not UPI_ENABLED:
         return jsonify({"error": "UPI 提链已暂停维护"}), 503
+    if link_type == "ph_short" and plan != "plus":
+        return jsonify({"error": "菲律宾短链仅支持 Plus 计划"}), 400
     defaults = PROVIDER_DEFAULTS.get(link_type, {})
     country = str(data.get("country") or defaults.get("country") or "US").upper()
-    requested_currency = str(data.get("currency") or defaults.get("currency") or COUNTRY_CURRENCY.get(country, "USD")).upper()
+    requested_currency = str(
+        data.get("currency")
+        or (COUNTRY_CURRENCY.get(country) if link_type == "paypal" else "")
+        or defaults.get("currency")
+        or COUNTRY_CURRENCY.get(country, "USD")
+    ).upper()
     currency, _currency_source = normalize_checkout_currency(country, requested_currency)
     entry_raw = data.get("entry_proxies")
     if entry_raw is None:
@@ -2376,22 +3263,23 @@ def start_checkout():
     exit_raw = data.get("exit_proxies")
     if exit_raw is None:
         exit_raw = data.get("exit_proxy") or data.get("payment_proxy") or ""
-    if not entry_raw:
+    dynamic_proxy_api = bool(data.get("dynamic_proxy_api")) and internal_request
+    if not entry_raw and not dynamic_proxy_api:
         return jsonify({"error": "请填写 Checkout 入口代理"}), 400
-    if link_type not in {"hosted", "pix"} and not exit_raw:
+    if link_type not in {"hosted", "pix", "momo"} and not exit_raw and not dynamic_proxy_api:
         return jsonify({"error": "当前支付路径需要填写支付出口代理"}), 400
     try:
-        entry_proxies = normalize_proxy_pool(entry_raw, "入口代理")
+        entry_proxies = normalize_proxy_pool(entry_raw,  "入口代理") if entry_raw else []
         exit_proxies = normalize_proxy_pool(exit_raw, "出口代理") if exit_raw else []
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    if not entry_proxies:
+    if not entry_proxies and not dynamic_proxy_api:
         return jsonify({"error": "入口代理至少填写 1 条"}), 400
-    if link_type not in {"hosted", "pix"} and not exit_proxies:
+    if link_type not in {"hosted", "pix", "momo"} and not exit_proxies and not dynamic_proxy_api:
         return jsonify({"error": "出口代理至少填写 1 条"}), 400
     raw_pix_tax_id = re.sub(r"\D", "", str(data.get("pix_tax_id") or ""))[:14] if link_type == "pix" else ""
     try:
-        retry_count = min(50, max(1, int(data.get("retry_count") or (10 if link_type == "pix" else 3))))
+        retry_count = min(10, max(1, int(data.get("retry_count") or (10 if link_type in {"pix", "momo", "gcash"} else 3))))
     except (TypeError, ValueError):
         return jsonify({"error": "重试次数需要填写 1-50 的整数"}), 400
     pix_identity: dict[str, str] = {}
@@ -2420,9 +3308,11 @@ def start_checkout():
         "checkout_country": country,
         "checkout_currency": currency,
         "entry_proxies": entry_proxies,
-        "exit_proxies": (exit_proxies or entry_proxies) if link_type == "pix" else exit_proxies,
+        "exit_proxies": (exit_proxies or entry_proxies) if link_type in {"pix", "momo"} else exit_proxies,
         "use_promo": bool(data.get("use_promo", True)) if plan == "plus" else False,
         "promo_campaign": str(data.get("promo_campaign") or "") if plan == "plus" else "",
+        "promo_country": str(data.get("promo_country") or "").strip().upper()[:2],
+        "oaics_paypal": bool(data.get("oaics_paypal")) and internal_request,
         "promo_code": str(data.get("promo_code") or "") if plan == "team" else "",
         "workspace_name": str(data.get("workspace_name") or "")[:80],
         "workspace_id": str(data.get("workspace_id") or "")[:120],
@@ -2436,7 +3326,22 @@ def start_checkout():
             if str(data.get("pix_auto_kind") or "cpf").lower() in {"mixed", "cpf", "cnpj"} else "cpf",
         "pix_identity": pix_identity,
         "retry_count": retry_count,
+        "paired_proxy_rotation": bool(data.get("paired_proxy_rotation", False)),
+        "use_sen": data.get("use_sen", True) is not False,
+        "use_so": data.get("use_so", True) is not False,
+        "dynamic_proxy_api": dynamic_proxy_api,
+        "allow_missing_customer_session": bool(data.get("allow_missing_customer_session")) and internal_request,
+        "entry_proxy_country": str(data.get("entry_proxy_country") or ("US" if link_type in {"gcash", "ph_short"} and country == "PH" else country)).upper(),
+        "exit_proxy_country": str(data.get("exit_proxy_country") or (str(data.get("promo_country") or "VN") if link_type == "gcash" else ((str(data.get("promo_country") or ("TR" if country == "PH" else country))) if link_type == "ph_short" and bool(data.get("use_promo", True)) else country))).upper(),
+        "proxy_session_time": min(120, max(1, int(data.get("proxy_session_time") or 10))),
     }
+    if link_type == "ph_short":
+        if country == "PH" and options["entry_proxy_country"] == "PH":
+            options["entry_proxy_country"] = "US"
+        if not options.get("use_promo"):
+            options["exit_proxy_country"] = options["entry_proxy_country"]
+        elif not str(data.get("exit_proxy_country") or "").strip() and not str(data.get("promo_country") or "").strip():
+            options["exit_proxy_country"] = "TR" if country == "PH" else country
     if not options["token_raw"].strip():
         return jsonify({"error": "请填写 Access Token 或 Session JSON"}), 400
     if link_type == "pix" and options["pix_tax_id"] and len(options["pix_tax_id"]) not in {11, 14}:

@@ -105,7 +105,13 @@ def run_upi(
             "UPI_FULLPAGE_FALLBACK_ENABLED": str(os.getenv("PAY153_UPI_GO_FULLPAGE", "1")),
         }
     )
-    command = [str(binary), "-slot", "-timeout", str(max(15, min(120, int(timeout_seconds))))]
+    command = [
+        str(binary),
+        "-slot",
+        "-full",
+        "-timeout",
+        str(max(15, min(120, int(timeout_seconds)))),
+    ]
     log("[upi-go] 启动 IN → VN → IN Elements/B 提取流程")
     # The final slot JSON can exceed an OS pipe buffer when retry diagnostics
     # are included. Temporary files keep the child from blocking on stdout.
@@ -161,6 +167,11 @@ def run_upi(
         promo_applied = int(str(amount)) == 0
     except (TypeError, ValueError):
         promo_applied = str(amount).strip() in {"0", "0.0", "0.00"}
+
+    if not promo_applied:
+        raise RuntimeError(
+            f"UPI Plus 优惠未生效：amount={amount} currency={currency}"
+        )
 
     log(
         "[upi-go] 提取完成：amount={} currency={} approve={} material={}".format(

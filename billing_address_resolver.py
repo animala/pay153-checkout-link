@@ -16,11 +16,15 @@ _RESOLVE_LOCK = threading.Lock()
 _NOMINATIM_LOCK = threading.Lock()
 _LAST_NOMINATIM_AT = 0.0
 _LAST_PICK: dict[str, str] = {}
+_RECENT_PICKS: dict[str, list[str]] = {}
+_PICK_LOCK = threading.Lock()
+_MEMORY_CACHE: dict[str, list[dict[str, str]]] | None = None
+_MEMORY_CACHE_MTIME_NS = -1
 
 _COUNTRY_NAMES = {
     "BA": "Bosnia and Herzegovina", "US": "United States", "BR": "Brazil",
     "IN": "India", "DE": "Germany", "NL": "Netherlands", "GB": "United Kingdom",
-    "FR": "France", "AU": "Australia", "JP": "Japan",
+    "FR": "France", "AU": "Australia", "JP": "Japan", "PH": "Philippines",
 }
 
 _BUILTIN_PUBLIC_ADDRESSES: dict[str, list[dict[str, str]]] = {
@@ -54,24 +58,41 @@ _BUILTIN_PUBLIC_ADDRESSES: dict[str, list[dict[str, str]]] = {
         {"name": "The Balmoral", "line1": "1 Princes St", "city": "Edinburgh", "state": "", "postal_code": "EH2 2EQ", "country": "GB", "source": "builtin_public"},
         {"name": "Kimpton Blythswood Square", "line1": "11 Blythswood Square", "city": "Glasgow", "state": "", "postal_code": "G2 4AD", "country": "GB", "source": "builtin_public"},
         {"name": "Titanic Hotel Liverpool", "line1": "Stanley Dock, Regent Rd", "city": "Liverpool", "state": "", "postal_code": "L3 0AN", "country": "GB", "source": "builtin_public"},
+    ],
+    "PH": [
+        {"name": "The Manila Hotel", "line1": "One Rizal Park, Ermita", "city": "Manila", "state": "Metro Manila", "postal_code": "0913", "country": "PH", "source": "builtin_public"},
+        {"name": "New World Makati Hotel", "line1": "Esperanza Street corner Makati Avenue", "city": "Makati", "state": "Metro Manila", "postal_code": "1228", "country": "PH", "source": "builtin_public"},
+        {"name": "Shangri-La The Fort", "line1": "30th Street corner 5th Avenue, Bonifacio Global City", "city": "Taguig", "state": "Metro Manila", "postal_code": "1634", "country": "PH", "source": "builtin_public"},
+        {"name": "Conrad Manila", "line1": "Seaside Boulevard, Mall of Asia Complex", "city": "Pasay", "state": "Metro Manila", "postal_code": "1300", "country": "PH", "source": "builtin_public"},
+        {"name": "Okada Manila", "line1": "New Seaside Drive, Entertainment City", "city": "Paranaque", "state": "Metro Manila", "postal_code": "1701", "country": "PH", "source": "builtin_public"},
+        {"name": "Seda BGC", "line1": "30th Street corner 11th Avenue, Bonifacio Global City", "city": "Taguig", "state": "Metro Manila", "postal_code": "1634", "country": "PH", "source": "builtin_public"},
     ]
 }
 
 
 def _load_cache() -> dict[str, list[dict[str, str]]]:
+    global _MEMORY_CACHE, _MEMORY_CACHE_MTIME_NS
     try:
+        mtime_ns = _CACHE_PATH.stat().st_mtime_ns
+        if _MEMORY_CACHE is not None and _MEMORY_CACHE_MTIME_NS == mtime_ns:
+            return _MEMORY_CACHE
         data = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        _MEMORY_CACHE = data if isinstance(data, dict) else {}
+        _MEMORY_CACHE_MTIME_NS = mtime_ns
+        return _MEMORY_CACHE
     except Exception:
         return {}
 
 
 def _save_cache(cache: dict[str, list[dict[str, str]]]) -> None:
+    global _MEMORY_CACHE, _MEMORY_CACHE_MTIME_NS
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CACHE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(_CACHE_PATH)
+        _MEMORY_CACHE = cache
+        _MEMORY_CACHE_MTIME_NS = _CACHE_PATH.stat().st_mtime_ns
     except Exception:
         pass
 
@@ -200,11 +221,48 @@ def _pick(key: str, rows: list[dict[str, str]], preferred_city: str = "") -> dic
             valid = local
     if not valid:
         return None
-    previous = _LAST_PICK.get(key, "")
-    choices = [row for row in valid if f"{row.get('line1')}|{row.get('postal_code')}" != previous] or valid
-    selected = dict(random.SystemRandom().choice(choices))
-    _LAST_PICK[key] = f"{selected.get('line1')}|{selected.get('postal_code')}"
+    with _PICK_LOCK:
+        recent = _RECENT_PICKS.setdefault(key, [])
+        recent_set = set(recent)
+        choices = [
+            row for row in valid
+            if f"{row.get('line1')}|{row.get('postal_code')}" not in recent_set
+        ] or valid
+        selected = dict(random.SystemRandom().choice(choices))
+        signature = f"{selected.get('line1')}|{selected.get('postal_code')}"
+        _LAST_PICK[key] = signature
+        recent.append(signature)
+        del recent[:-64]
     return selected
+
+
+def resolve_cached_country_address(country: str, preferred_city: str = "") -> dict[str, str] | None:
+    """Pick an already validated address from the whole country cache.
+
+    This path never performs a network lookup, so high-concurrency checkout
+    jobs can rotate addresses without serializing on Nominatim.
+    """
+    country = str(country or "").upper()
+    with _CACHE_LOCK:
+        cache = _load_cache()
+        rows: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for key, values in cache.items():
+            if not str(key).upper().startswith(country + "|") or not isinstance(values, list):
+                continue
+            for row in values:
+                if not isinstance(row, dict):
+                    continue
+                signature = (
+                    str(row.get("line1") or "").strip().casefold(),
+                    str(row.get("city") or "").strip().casefold(),
+                    str(row.get("postal_code") or "").strip().casefold(),
+                )
+                if not all(signature) or signature in seen:
+                    continue
+                seen.add(signature)
+                rows.append(dict(row))
+    return _pick(f"{country}|__country_pool__", rows, preferred_city)
 
 
 def resolve_public_address(country: str, city: str = "", region: str = "", postal_hint: str = "") -> dict[str, str] | None:

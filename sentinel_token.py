@@ -48,7 +48,7 @@ def fnv1a_32(s: str) -> str:
 # ============================================================
 # 浏览器指纹数据 (伪造)
 # ============================================================
-FAKE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+FAKE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
 FAKE_SCRIPT_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
 FAKE_DATA_BUILD = "070b149f77ea"
 
@@ -126,7 +126,7 @@ def _fake_navigator_value(prop: str) -> str:
         "product": "Gecko",
         "productSub": "20030107",
         "appName": "Netscape",
-        "appVersion": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "appVersion": "5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
         "hardwareConcurrency": "8",
         "deviceMemory": "8",
         "maxTouchPoints": "0",
@@ -687,6 +687,7 @@ class SentinelTokenProvider:
         self._last_fetch_time: float = 0
         self._device_id: str = ""
         self._cached_flow: str = ""
+        self._last_init_error: str = ""
 
     async def _get_session(self) -> requests.AsyncSession:
         if not self._session:
@@ -716,6 +717,7 @@ class SentinelTokenProvider:
         proof = await asyncio.to_thread(generate_requirements_token, self.sid)
         self._cached_proof = proof
         chat_req = await self._post_proof(proof, flow)
+        self._last_init_error = str(chat_req.get("error") or "") if isinstance(chat_req, dict) else "SENTINEL_INIT_INVALID_PAYLOAD"
         self._cached_chat_req = chat_req
         self._last_fetch_time = time.time()
         self._cached_flow = flow
@@ -747,6 +749,7 @@ class SentinelTokenProvider:
             "so_required": False,
             "has_t": False,
             "has_so": False,
+            "init_error": self._last_init_error,
         }
         try:
             if not chat_req or "error" in chat_req or not proof:
