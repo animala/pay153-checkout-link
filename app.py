@@ -1292,6 +1292,7 @@ class JobStore:
         self.condition = threading.Condition(self.lock)
         self.file_lock = threading.RLock()
         self.jobs: dict[str, dict] = {}
+        self.launch_contexts: dict[str, dict] = {}
         self.worker_limit = max(1, int(os.getenv("PAY153_WORKERS", "20")))
         self.global_rpm = max(1, int(os.getenv("PAY153_GLOBAL_RPM", "20")))
         self.pool = ThreadPoolExecutor(max_workers=self.worker_limit)
@@ -1499,6 +1500,61 @@ class JobStore:
             snapshot["logs"] = [item for item in snapshot.get("logs") or [] if item.get("major")]
         return snapshot
 
+    def add_roxy_launch_context(self, job_id: str, options: dict, result: dict) -> dict:
+        """Attach an opaque launch token while keeping proxy credentials server-side."""
+        provider = str(options.get("link_type") or result.get("link_type") or "").lower()
+        final_url = str(
+            result.get("short_link")
+            or result.get("verification_url")
+            or result.get("provider_redirect_url")
+            or result.get("paypal_link")
+            or result.get("checkout_url")
+            or result.get("url")
+            or result.get("link")
+            or ""
+        ).strip()
+        entry_browser_providers = {"hosted", "ph_short", "pix", "momo", "gcash"}
+        proxy_url = str(
+            options.get("fixed_entry_proxy")
+            if provider in entry_browser_providers
+            else options.get("fixed_exit_proxy")
+        ).strip()
+        available = bool(final_url.startswith(("http://", "https://")) and proxy_url)
+        result["roxy_available"] = available
+        if not available:
+            return result
+
+        now = time.time()
+        token = secrets.token_urlsafe(32)
+        ttl = max(60, min(7200, int(os.getenv("PAY153_ROXY_TOKEN_TTL", "1800") or 1800)))
+        with self.lock:
+            expired = [
+                key for key, value in self.launch_contexts.items()
+                if float(value.get("expires_at") or 0) <= now
+            ]
+            for key in expired:
+                self.launch_contexts.pop(key, None)
+            self.launch_contexts[token] = {
+                "job_id": job_id,
+                "provider": provider,
+                "final_url": final_url,
+                "proxy_url": proxy_url,
+                "expires_at": now + ttl,
+            }
+        result["roxy_launch_token"] = token
+        return result
+
+    def get_roxy_launch_context(self, token: str) -> dict | None:
+        now = time.time()
+        with self.lock:
+            context = self.launch_contexts.get(str(token or ""))
+            if not context:
+                return None
+            if float(context.get("expires_at") or 0) <= now:
+                self.launch_contexts.pop(str(token or ""), None)
+                return None
+            return dict(context)
+
     def cancel(self, job_id: str) -> bool:
         with self.condition:
             if job_id not in self.jobs:
@@ -1677,6 +1733,7 @@ class JobStore:
                     result = state["result"]
                     result["attempt"] = attempt
                     result["max_attempts"] = max_attempts
+                    self.add_roxy_launch_context(job_id, current, result)
                     self.update(job_id, result=result)
                     self._record_success(job_id, result)
                 return
@@ -3170,8 +3227,22 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
-def _internal_key_valid(value: str) -> bool:
+def _configured_internal_key() -> str:
     expected = str(os.getenv("PAY153_INTERNAL_KEY") or "").strip()
+    key_file = str(os.getenv("PAY153_INTERNAL_KEY_FILE") or "").strip()
+    if not key_file:
+        default_key_file = ROOT.parent / "gpt_register_pay" / ".pay153-internal-key"
+        key_file = str(default_key_file) if default_key_file.is_file() else ""
+    if not expected and key_file:
+        try:
+            expected = Path(key_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            expected = ""
+    return expected
+
+
+def _internal_key_valid(value: str) -> bool:
+    expected = _configured_internal_key()
     supplied = str(value or "").strip()
     return bool(expected and supplied and hmac.compare_digest(supplied, expected))
 
@@ -3204,6 +3275,23 @@ def private_checkout_page():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "pay153", "time": int(time.time())})
+
+
+@app.post("/api/internal/roxy-launch-context")
+def roxy_launch_context():
+    if str(request.remote_addr or "").strip() not in {"127.0.0.1", "::1"}:
+        return jsonify({"ok": False, "error": "Not Found"}), 404
+    expected_key = _configured_internal_key()
+    if expected_key and not _internal_key_valid(request.headers.get("X-Pay153-Internal-Key") or ""):
+        return jsonify({"ok": False, "error": "内部接口密钥不匹配"}), 403
+    data = request.get_json(silent=True) or {}
+    token = str(data.get("launch_token") or "").strip()
+    if len(token) < 24 or len(token) > 160:
+        return jsonify({"ok": False, "error": "Roxy 启动令牌无效"}), 400
+    context = STORE.get_roxy_launch_context(token)
+    if not context:
+        return jsonify({"ok": False, "error": "Roxy 启动令牌不存在或已过期"}), 404
+    return jsonify({"ok": True, **context})
 
 
 @app.get("/api/config")

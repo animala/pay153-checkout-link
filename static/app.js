@@ -12,6 +12,11 @@ let progressLastTick = 0;
 let proxySaveTimer = 0;
 let logAutoFollow = true;
 let renderedLogKey = '';
+let roxyLaunchToken = '';
+let roxySessionId = '';
+let roxyProfileId = '';
+let phShortProxyLoaded = false;
+let phShortProxyPromise = null;
 
 const PROXY_STORAGE_KEYS = {
   entry: 'pay153.proxy_pool_1',
@@ -41,13 +46,13 @@ function setProxySaveState(text, failed=false){
   node.textContent = text;
   node.classList.toggle('save-failed', failed);
 }
-function saveProxyPools(){
+function saveProxyPools(successText='已保存到本机'){
   clearTimeout(proxySaveTimer);
   proxySaveTimer = setTimeout(() => {
     try {
       localStorage.setItem(PROXY_STORAGE_KEYS.entry, $('entryProxy').value);
       localStorage.setItem(PROXY_STORAGE_KEYS.exit, $('exitProxy').value);
-      setProxySaveState('已保存到本机');
+      setProxySaveState(successText);
     } catch (error) {
       setProxySaveState('本地保存失败', true);
     }
@@ -74,7 +79,81 @@ function bindChoices(group, onChange){
   }));
 }
 bindChoices($('planGrid'), () => syncFields(false));
-bindChoices($('railGrid'), () => syncFields(true));
+bindChoices($('railGrid'), () => {
+  syncFields(true);
+  if (selected('link_type') === 'ph_short') loadPhShortProxies(true);
+});
+
+async function loadFreeAccountToken(accountId){
+  if (!accountId) return;
+  $('freeAccountSelect').disabled = true;
+  try {
+    const response = await fetch(`/api/pay153/free-accounts/${encodeURIComponent(accountId)}/token`, {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    $('token').value = data.access_token || '';
+    $('tokenHint').textContent = `已导入 ${data.email || 'Free 账号'}`;
+  } catch (error) {
+    $('tokenHint').textContent = error.message || String(error);
+  } finally {
+    $('freeAccountSelect').disabled = false;
+  }
+}
+
+async function loadFreeAccounts(){
+  const select = $('freeAccountSelect');
+  const refresh = $('refreshFreeAccounts');
+  refresh.disabled = true;
+  select.disabled = true;
+  try {
+    const response = await fetch('/api/pay153/free-accounts', {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const items = Array.isArray(data.items) ? data.items : [];
+    select.innerHTML = items.length
+      ? items.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.email)} · Free</option>`).join('')
+      : '<option value="">没有可用的 Free 账号</option>';
+    select.disabled = !items.length;
+    if (items.length) {
+      select.value = String(data.selected_id || items[0].id);
+      await loadFreeAccountToken(select.value);
+    } else {
+      $('tokenHint').textContent = '没有可用的 Free 账号，可手动输入';
+    }
+  } catch (error) {
+    select.innerHTML = '<option value="">手动输入 Access Token</option>';
+    $('tokenHint').textContent = error.message || String(error);
+  } finally {
+    refresh.disabled = false;
+  }
+}
+
+async function loadPhShortProxies(force=false){
+  if (selected('link_type') !== 'ph_short') return;
+  if (phShortProxyLoaded && !force) return;
+  if (phShortProxyPromise) return phShortProxyPromise;
+  phShortProxyPromise = (async () => {
+    setProxySaveState('正在读取 US / TR 代理');
+    try {
+      const response = await fetch('/api/pay153/ph-short-proxies', {cache:'no-store'});
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      $('entryProxy').value = (data.entry_proxies || []).join('\n');
+      $('exitProxy').value = (data.exit_proxies || []).join('\n');
+      updateProxyCount($('entryProxy'), $('entryProxyCount'));
+      updateProxyCount($('exitProxy'), $('exitProxyCount'));
+      phShortProxyLoaded = true;
+      saveProxyPools(`已导入 US ${data.entry_count || 0} / TR ${data.exit_count || 0}`);
+    } catch (error) {
+      phShortProxyLoaded = false;
+      setProxySaveState(error.message || String(error), true);
+      throw error;
+    } finally {
+      phShortProxyPromise = null;
+    }
+  })();
+  return phShortProxyPromise;
+}
 
 function syncFields(applyRailDefault=false){
   const plan = selected('plan'), rail = selected('link_type');
@@ -117,8 +196,10 @@ function syncFields(applyRailDefault=false){
 }
 $('country').addEventListener('change', () => $('currency').value = countryCurrency[$('country').value] || 'USD');
 $('usePromo').addEventListener('change', () => syncFields(false));
-$('entryProxy').addEventListener('input', () => { updateProxyCount($('entryProxy'), $('entryProxyCount')); saveProxyPools(); });
-$('exitProxy').addEventListener('input', () => { updateProxyCount($('exitProxy'), $('exitProxyCount')); saveProxyPools(); });
+$('entryProxy').addEventListener('input', () => { phShortProxyLoaded = false; updateProxyCount($('entryProxy'), $('entryProxyCount')); saveProxyPools(); });
+$('exitProxy').addEventListener('input', () => { phShortProxyLoaded = false; updateProxyCount($('exitProxy'), $('exitProxyCount')); saveProxyPools(); });
+$('freeAccountSelect').addEventListener('change', () => loadFreeAccountToken($('freeAccountSelect').value));
+$('refreshFreeAccounts').addEventListener('click', loadFreeAccounts);
 $('copyEntryProxy').addEventListener('click', () => {
   $('exitProxy').value = $('entryProxy').value.trim();
   updateProxyCount($('exitProxy'), $('exitProxyCount'));
@@ -225,6 +306,15 @@ function showResult(result){
   const verifyUrl = result.verification_url || '';
   $('verifyResult').href = verifyUrl || '#';
   $('verifyResult').hidden = !verifyUrl;
+  roxyLaunchToken = String(result.roxy_launch_token || '');
+  $('openInRoxy').hidden = Boolean(roxySessionId) || !(result.roxy_available && roxyLaunchToken);
+  $('openInRoxy').disabled = false;
+  $('closeRoxy').hidden = !roxySessionId;
+  $('closeRoxy').disabled = false;
+  $('roxyStatus').textContent = roxySessionId
+    ? `Roxy 环境 ${roxyProfileId || '—'} 仍在运行，请使用关闭按钮清理`
+    : (result.roxy_available ? '可使用本次成功线路在 Roxy 中打开' : '');
+  $('roxyStatus').className = 'roxy-status';
   const qr = isIdeal
     ? (result.qr_image_svg || result.qr_image_png || '')
     : (result.qr_image_png || result.qr_image_svg || '');
@@ -253,7 +343,17 @@ async function poll(){
 }
 
 form.addEventListener('submit', async (event) => {
-  event.preventDefault(); $('resultPanel').hidden = true; $('logBox').innerHTML = '<div class="empty-log">正在创建任务…</div>';
+  event.preventDefault();
+  if (selected('link_type') === 'ph_short') {
+    try {
+      await loadPhShortProxies(false);
+    } catch (error) {
+      setProgress(100, error.message || String(error), 'error');
+      return;
+    }
+  }
+  if (!roxySessionId) $('resultPanel').hidden = true;
+  $('logBox').innerHTML = '<div class="empty-log">正在创建任务…</div>';
   renderedLogKey = '';
   logAutoFollow = true;
   resetProgress();
@@ -295,6 +395,62 @@ $('cancelButton').addEventListener('click', async () => {
 });
 $('copyResult').addEventListener('click', async () => { await navigator.clipboard.writeText($('resultValue').value || ''); const old=$('copyResult').textContent; $('copyResult').textContent='已复制'; setTimeout(()=>$('copyResult').textContent=old,1200); });
 
+$('openInRoxy').addEventListener('click', async () => {
+  if (!roxyLaunchToken || roxySessionId) return;
+  const button = $('openInRoxy');
+  button.disabled = true;
+  $('roxyStatus').className = 'roxy-status';
+  $('roxyStatus').textContent = '正在创建 Roxy 临时环境…';
+  try {
+    const response = await fetch('/api/pay153/roxy/open', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({launch_token: roxyLaunchToken})
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    roxySessionId = String(data.session_id || '');
+    roxyProfileId = String(data.profile_id || '');
+    button.hidden = true;
+    $('closeRoxy').hidden = false;
+    $('roxyStatus').className = 'roxy-status success';
+    $('roxyStatus').textContent = `Roxy 已打开（环境 ${data.profile_id || '—'}）`;
+  } catch (error) {
+    button.disabled = false;
+    $('roxyStatus').className = 'roxy-status error';
+    $('roxyStatus').textContent = error.message || String(error);
+  }
+});
+
+$('closeRoxy').addEventListener('click', async () => {
+  if (!roxySessionId) return;
+  const button = $('closeRoxy');
+  button.disabled = true;
+  $('roxyStatus').className = 'roxy-status';
+  $('roxyStatus').textContent = '正在关闭并删除 Roxy 临时环境…';
+  try {
+    const response = await fetch('/api/pay153/roxy/close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: roxySessionId})
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    roxySessionId = '';
+    roxyProfileId = '';
+    button.hidden = true;
+    button.disabled = false;
+    $('openInRoxy').hidden = !roxyLaunchToken;
+    $('openInRoxy').disabled = false;
+    $('roxyStatus').className = 'roxy-status success';
+    $('roxyStatus').textContent = 'Roxy 环境已关闭并删除';
+  } catch (error) {
+    button.disabled = false;
+    $('roxyStatus').className = 'roxy-status error';
+    $('roxyStatus').textContent = error.message || String(error);
+  }
+});
+
 function applyTheme(dark){
   document.documentElement.classList.toggle('dark',dark);
   localStorage.setItem('pay153-theme',dark?'dark':'light');
@@ -324,3 +480,4 @@ syncFields(true);
 restoreProxyPools();
 updateProxyCount($('entryProxy'), $('entryProxyCount'));
 updateProxyCount($('exitProxy'), $('exitProxyCount'));
+loadFreeAccounts();

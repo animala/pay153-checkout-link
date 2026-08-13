@@ -6,18 +6,22 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="static/styles.css?v=20260813-embedded-1">
+  <link rel="stylesheet" href="static/styles.css?v=20260813-account-proxy-1">
 </head>
 <body>
   <div class="paper-noise"></div>
   <main class="shell">
     <section class="workspace-grid">
       <form id="checkoutForm" class="panel form-panel">
-        <label class="field token-field">
+        <div class="field token-field">
           <span class="label-row"><b>Access Token / Session JSON</b><small id="tokenHint">自动识别账号信息</small></span>
+          <div class="account-import-row">
+            <select id="freeAccountSelect" aria-label="Free 套餐账号"><option value="">正在读取 Free 账号…</option></select>
+            <button id="refreshFreeAccounts" class="icon-button" type="button" title="刷新 Free 账号" aria-label="刷新 Free 账号">↻</button>
+          </div>
           <textarea id="token" name="token" required autocomplete="off" spellcheck="false" placeholder="粘贴 Access Token，或 chatgpt.com/api/auth/session 返回的 JSON"></textarea>
           <span class="field-note">内容不写入数据库，服务日志会自动隐藏 Token。</span>
-        </label>
+        </div>
 
         <fieldset class="field-group">
           <legend>订阅 / 空间</legend>
@@ -160,12 +164,13 @@
             <div><span>Session</span><code id="resultSession">—</code></div>
           </div>
           <label class="field result-link"><span>最终链接 / 付款码</span><textarea id="resultValue" readonly></textarea></label>
-          <div class="result-actions"><a id="openResult" class="primary-button" target="_blank" rel="noopener noreferrer">打开长链</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button></div>
+          <div class="result-actions"><button id="openInRoxy" class="primary-button" type="button" hidden>在 Roxy 打开</button><button id="closeRoxy" class="secondary-button" type="button" hidden>关闭 Roxy</button><a id="openResult" class="secondary-button" target="_blank" rel="noopener noreferrer">普通浏览器打开</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button></div>
+          <p id="roxyStatus" class="roxy-status" role="status" aria-live="polite"></p>
         </section>
       </aside>
     </section>
   </main>
 
-  <script src="static/app.js?v=20260813-embedded-1"></script>
+  <script src="static/app.js?v=20260813-account-proxy-1"></script>
 </body>
 </html>

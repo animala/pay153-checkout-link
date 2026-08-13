@@ -111,6 +111,8 @@ cp .env.example .env
 | `PAY153_LOG_DIR` | 完整后台日志目录 |
 | `PAY153_LEGACY_BASE` | 旧服务兼容地址，可选 |
 | `PAY153_INTERNAL_KEY` | 内部 API 请求头校验密钥 |
+| `PAY153_INTERNAL_KEY_FILE` | 内部 API 共享密钥文件路径，可替代直接配置密钥 |
+| `PAY153_ROXY_TOKEN_TTL` | Roxy 启动令牌有效期，默认 1800 秒 |
 | `PAY153_PRIVATE_PAGE_KEY` | 私有直通页首次访问密钥，与内部 API 密钥分离 |
 | `PAY153_INTERNAL_WORKERS` | 私有直通独立执行池并发数，默认 `5` |
 | `PAY153_UPI_GO_BINARY` | UPI Go 二进制路径，默认 `tools/upi_go/pix_extract_slot` |

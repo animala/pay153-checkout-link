@@ -129,6 +129,7 @@ textarea:focus,input:focus,select:focus{border-color:rgba(109,74,255,.72);backgr
 textarea::placeholder,input::placeholder{color:#9ba3b5}
 select{cursor:pointer}
 .token-field textarea{min-height:142px;resize:vertical;font:12px/1.7 var(--mono);background:linear-gradient(145deg,#f8f9fd,#f1f3f9)}
+.account-import-row{display:grid;grid-template-columns:minmax(0,1fr) 44px;gap:8px;margin-bottom:9px}.account-import-row select{min-width:0}.icon-button{width:44px;min-height:44px;border:1px solid var(--line);border-radius:13px;background:var(--surface-2);color:var(--ink);cursor:pointer;font-size:20px;line-height:1}.icon-button:hover{border-color:var(--brand);color:var(--brand)}.icon-button:disabled{cursor:wait;opacity:.55}
 .field-note,.inline-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.6}
 .field-group{border:0;padding:0;margin:26px 0}
 .field-group legend{margin-bottom:11px;color:var(--muted);font:800 11px var(--display);letter-spacing:.08em;text-transform:uppercase}
@@ -185,6 +186,7 @@ select{cursor:pointer}
 .advanced{border:1px solid var(--line);border-radius:15px;overflow:hidden}.advanced summary{cursor:pointer;padding:14px 16px;list-style:none;display:flex;justify-content:space-between;font-size:12px;font-weight:800}.advanced summary span{color:var(--muted);font-weight:500}.advanced-body{padding:16px;border-top:1px solid var(--line)}
 
 .form-actions,.result-actions{display:flex;gap:10px;margin-top:24px}
+.result-actions{flex-wrap:wrap}.roxy-status{min-height:20px;margin:10px 0 0;color:var(--muted);font-size:12px;line-height:1.6}.roxy-status.error{color:#c43c4e}.roxy-status.success{color:#14805e}
 .primary-button,.secondary-button{min-height:50px;border-radius:14px;padding:0 19px;display:inline-flex;align-items:center;justify-content:center;gap:28px;text-decoration:none;cursor:pointer;font-size:13px;font-weight:800;transition:.18s}
 .primary-button{border:0;color:white;background:linear-gradient(115deg,var(--brand),#5536d3 62%,#352285);box-shadow:0 15px 32px rgba(109,74,255,.25)}
 .primary-button:hover{transform:translateY(-2px);box-shadow:0 19px 38px rgba(109,74,255,.31)}
