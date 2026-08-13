@@ -35,13 +35,13 @@ Use ``--credential-file -`` to read a token or session JSON from stdin.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import getpass
 import json
 import os
 import random
 import re
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +50,11 @@ from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; the service runs as one process.
+    fcntl = None  # type: ignore[assignment]
 
 try:
     from curl_cffi.requests import Session as CurlSession
@@ -85,6 +90,7 @@ PAYMENT_COOKIE_NAMES = frozenset(
     }
 )
 RETRYABLE_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
+_CONTEXT_FILE_LOCK = threading.Lock()
 
 
 class ExtractorError(RuntimeError):
@@ -254,17 +260,15 @@ def persist_private_checkout_context(
     }
     target = Path(os.getenv("PH_SHORT_CONTEXT_PATH", "/opt/pay153/data/ph_short_contexts.jsonl"))
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8", newline="\n") as handle:
-        try:
+    with _CONTEXT_FILE_LOCK, target.open("a", encoding="utf-8", newline="\n") as handle:
+        if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-        handle.flush()
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
+            handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def parse_credentials(raw: str, explicit_session_cookie: str = "") -> Credentials:

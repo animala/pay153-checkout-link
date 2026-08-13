@@ -781,9 +781,10 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
                     "promotion_processor": str(offer.get("processor") or ""),
                     "promotion_transport": str(offer.get("transport") or ""),
                 }
+                campaign_label = campaign_id or "\u5f53\u524d\u65e0\u4f18\u60e0"
                 log(
                     f"Rust \u4f18\u60e0\u68c0\u6d4b\u5b8c\u6210\uff1a"
-                    f"{campaign_id or '\u5f53\u524d\u65e0\u4f18\u60e0'}\uff08{normalized['promotion_transport']}\uff09"
+                    f"{campaign_label}\uff08{normalized['promotion_transport']}\uff09"
                 )
                 return normalized
             log(f"Rust \u4f18\u60e0\u68c0\u6d4b HTTP {rust_response.status_code}\uff0c\u56de\u9000 Python")
@@ -844,7 +845,8 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
             "eligible_offers": account.get("eligible_offers") or {},
         }
         if campaign_id:
-            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u5df2\u5339\u914d\uff1a{campaign_id}\uff08{label or 'Plus \u6d3b\u52a8'}\uff09")
+            promotion_label = label or "Plus \u6d3b\u52a8"
+            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u5df2\u5339\u914d\uff1a{campaign_id}\uff08{promotion_label}\uff09")
         else:
             log("\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u672a\u8fd4\u56de Plus \u4f18\u60e0")
         return normalized

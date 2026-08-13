@@ -243,7 +243,7 @@ function startCountdown(expiresAt){
 async function poll(){
   if (!jobId) return;
   try{
-    const r = await fetch(`/api/checkout-progress?job_id=${encodeURIComponent(jobId)}`, {cache:'no-store'});
+    const r = await fetch(`api/checkout-progress?job_id=${encodeURIComponent(jobId)}`, {cache:'no-store'});
     const data = await r.json(); if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
     setProgress(data.percent, data.text, data.status);
     renderLogs(data.logs);
@@ -276,7 +276,7 @@ form.addEventListener('submit', async (event) => {
     pix_auto_kind: selected('link_type') === 'pix' ? $('pixAutoKind').value : 'cpf'
   };
   try{
-    const r = await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r = await fetch('api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const data = await r.json(); if(!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
     jobId = data.job_id;
     if (data.internal) setProgress(4, '私有直通任务已进入独立执行池', 'running');
@@ -289,7 +289,7 @@ $('cancelButton').addEventListener('click', async () => {
   if(!jobId) return;
   setRunning(false);
   setProgress(100,'任务已停止','cancelled');
-  await fetch('/api/checkout-cancel',{
+  await fetch('api/checkout-cancel',{
     method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:jobId})
   });
 });
@@ -298,13 +298,16 @@ $('copyResult').addEventListener('click', async () => { await navigator.clipboar
 function applyTheme(dark){
   document.documentElement.classList.toggle('dark',dark);
   localStorage.setItem('pay153-theme',dark?'dark':'light');
-  $('themeToggle').textContent = dark ? '☀' : '☾';
-  $('themeToggle').setAttribute('aria-label', dark ? '切换到浅色模式' : '切换到深色模式');
+  const themeToggle = $('themeToggle');
+  if (themeToggle) {
+    themeToggle.textContent = dark ? '☀' : '☾';
+    themeToggle.setAttribute('aria-label', dark ? '切换到浅色模式' : '切换到深色模式');
+  }
 }
 const requestedTheme = new URLSearchParams(location.search).get('theme');
 const saved=localStorage.getItem('pay153-theme');
 applyTheme(requestedTheme ? requestedTheme === 'dark' : (saved ? saved==='dark' : matchMedia('(prefers-color-scheme: dark)').matches));
-$('themeToggle').addEventListener('click',()=>applyTheme(!document.documentElement.classList.contains('dark')));
+if ($('themeToggle')) $('themeToggle').addEventListener('click',()=>applyTheme(!document.documentElement.classList.contains('dark')));
 if (privateMode) {
   document.body.classList.add('private-mode');
   document.title = 'PAY.153 · 私有直通提链';

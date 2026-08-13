@@ -6,47 +6,13 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="/static/styles.css?v=20260728-momo-vn-1">
+  <link rel="stylesheet" href="static/styles.css?v=20260813-embedded-1">
 </head>
 <body>
   <div class="paper-noise"></div>
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="PAY.153 首页">
-      <span class="brand-mark"><i></i>P</span>
-      <span><b>PAY.153</b><small>CHECKOUT ROUTER</small></span>
-    </a>
-    <div class="top-actions">
-      <a class="protocol-nav-link" href="/paypal-pay/">PayPal 协议支付</a>
-      <span class="service-dot"><i></i> 服务在线</span>
-      <button id="themeToggle" class="icon-button" type="button" aria-label="切换主题">◐</button>
-    </div>
-  </header>
-
   <main class="shell">
-    <section class="hero">
-      <div class="hero-copy">
-        <div class="eyebrow"><span>01</span> MULTI-RAIL CHECKOUT</div>
-        <h1>把支付路径，<em>交给一张控制台。</em></h1>
-        <p>输入会话、选择通道、交给任务队列。Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay 与空间方案统一在一个流程内完成。</p>
-        <div class="hero-chips">
-          <span>PayPal</span><span>iDEAL</span><span>UPI QR</span><span>PIX</span><span>Kakao</span><span>Team</span><span>Codex</span>
-        </div>
-      </div>
-      <div class="hero-board" aria-label="服务能力">
-        <div><small>ROUTES</small><strong>05</strong><span>支付通道</span></div>
-        <div><small>PUBLIC RATE</small><strong>20</strong><span>任务 / 分钟</span></div>
-        <div><small>TOKEN MODE</small><strong>RAM</strong><span>仅任务内存</span></div>
-      </div>
-    </section>
-
     <section class="workspace-grid">
       <form id="checkoutForm" class="panel form-panel">
-        <div class="panel-heading">
-          <div><span class="section-index">A</span><h2>提链参数</h2></div>
-          <span class="quiet">公开工作台</span>
-        </div>
-        <div class="public-limit-note"><b>公共服务限制</b><span>全站每分钟处理 20 个新任务，超出后自动排队；同一 IP 每分钟最多创建 3 个任务。</span></div>
-
         <label class="field token-field">
           <span class="label-row"><b>Access Token / Session JSON</b><small id="tokenHint">自动识别账号信息</small></span>
           <textarea id="token" name="token" required autocomplete="off" spellcheck="false" placeholder="粘贴 Access Token，或 chatgpt.com/api/auth/session 返回的 JSON"></textarea>
@@ -200,7 +166,6 @@
     </section>
   </main>
 
-  <footer><span>PAY.153.INK</span><p>任务完成后请及时使用链接；支付提供商生成的二维码通常具有有效期。</p></footer>
-  <script src="/static/app.js?v=20260731-gcash-route-1"></script>
+  <script src="static/app.js?v=20260813-embedded-1"></script>
 </body>
 </html>
