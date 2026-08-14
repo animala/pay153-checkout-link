@@ -203,7 +203,7 @@ select{cursor:pointer}
 .form-actions,.result-actions{display:flex;gap:10px;margin-top:24px}
 .launch-actions{display:flex;gap:10px;min-height:44px}
 .launch-actions .primary-button,.launch-actions .secondary-button{flex:1;min-width:0;min-height:44px}
-.result-actions{flex-wrap:wrap}.roxy-status{min-height:20px;margin:10px 0 0;color:var(--muted);font-size:12px;line-height:1.6}.roxy-status.error{color:#c43c4e}.roxy-status.success{color:#14805e}
+.result-actions{flex-wrap:wrap}.payment-status{min-height:20px;margin:10px 0 0;color:var(--muted);font-size:12px;line-height:1.6}.payment-status.error{color:#c43c4e}.payment-status.success{color:#14805e}
 .primary-button,.secondary-button{min-height:50px;border-radius:14px;padding:0 19px;display:inline-flex;align-items:center;justify-content:center;gap:28px;text-decoration:none;cursor:pointer;font-size:13px;font-weight:800;transition:.18s}
 .primary-button{border:0;color:white;background:linear-gradient(115deg,var(--brand),#5536d3 62%,#352285);box-shadow:0 15px 32px rgba(109,74,255,.25)}
 .primary-button:hover{transform:translateY(-2px);box-shadow:0 19px 38px rgba(109,74,255,.31)}

@@ -6,14 +6,9 @@ let batchPollTimer = 0;
 let batchPollInFlight = false;
 let activeTaskKey = '';
 let countdownTimer = 0;
-let paypalRedirectTimer = 0;
-let paypalWindow = null;
 let proxySaveTimer = 0;
 let logAutoFollow = true;
 let renderedLogKey = '';
-let roxyLaunchToken = '';
-let roxySessionId = '';
-let roxyProfileId = '';
 let phShortProxyLoaded = false;
 let phShortProxyPromise = null;
 let accountLoadVersion = 0;
@@ -398,12 +393,12 @@ function renderLogs(logs){
   else box.scrollTop = previousTop;
 }
 function escapeHtml(v){ return String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
-function renderActiveTask(allowRedirect=false){
+function renderActiveTask(){
   const task = batchTasks.find(item => item.key === activeTaskKey);
   $('activeLogAccount').textContent = task?.email || '等待任务';
   renderedLogKey = '';
   renderLogs(task?.logs || []);
-  if (task?.result) showResult(task.result, {allowRedirect, scroll:false});
+  if (task?.result) showResult(task.result, {scroll:false});
   else $('resultPanel').hidden = true;
 }
 function selectTask(taskKey){
@@ -430,8 +425,7 @@ $('logBox').addEventListener('scroll', () => {
   logAutoFollow = box.scrollHeight - box.clientHeight - box.scrollTop < 28;
 });
 
-function showResult(result, {allowRedirect=false, scroll=false}={}){
-  clearTimeout(paypalRedirectTimer);
+function showResult(result, {scroll=false}={}){
   $('resultPanel').hidden = false;
   $('resultType').textContent = `${String(result.plan||'').toUpperCase()} · ${String(result.link_type||'').toUpperCase()}`;
   $('resultEmail').textContent = result.account_email || '—';
@@ -455,15 +449,9 @@ function showResult(result, {allowRedirect=false, scroll=false}={}){
   const verifyUrl = result.verification_url || '';
   $('verifyResult').href = verifyUrl || '#';
   $('verifyResult').hidden = !verifyUrl;
-  roxyLaunchToken = String(result.roxy_launch_token || '');
-  $('openInRoxy').hidden = Boolean(roxySessionId) || !(result.roxy_available && roxyLaunchToken);
-  $('openInRoxy').disabled = false;
-  $('closeRoxy').hidden = !roxySessionId;
-  $('closeRoxy').disabled = false;
-  $('roxyStatus').textContent = roxySessionId
-    ? `Roxy 环境 ${roxyProfileId || '—'} 仍在运行，请使用关闭按钮清理`
-    : (result.roxy_available ? '可使用本次成功线路在 Roxy 中打开' : '');
-  $('roxyStatus').className = 'roxy-status';
+  $('openPaypalProtocol').disabled = !finalValue;
+  $('paymentStatus').textContent = finalValue ? '点击 PayPal 支付后会自动带入当前链接。' : '';
+  $('paymentStatus').className = 'payment-status';
   const qr = isIdeal
     ? (result.qr_image_svg || result.qr_image_png || '')
     : (result.qr_image_png || result.qr_image_svg || '');
@@ -471,44 +459,6 @@ function showResult(result, {allowRedirect=false, scroll=false}={}){
   if (qr) $('qrImage').src = qr;
   startCountdown(result.expires_at);
   if (scroll) $('resultPanel').scrollIntoView({behavior:'smooth',block:'nearest'});
-  if (allowRedirect) schedulePayPalRedirect(result);
-}
-function schedulePayPalRedirect(result){
-  const provider = String(result.link_type || result.provider || '').toLowerCase();
-  if (provider !== 'paypal') return;
-  const rawUrl = result.paypal_link || result.paypal_url || result.provider_redirect_url || result.checkout_url || '';
-  let target = '';
-  try {
-    const parsed = new URL(String(rawUrl).trim(), window.location.href);
-    const host = parsed.hostname.toLowerCase();
-    const isPayPalHost = host === 'paypal.com' || host.endsWith('.paypal.com')
-      || host === 'paypalobjects.com' || host.endsWith('.paypalobjects.com');
-    if (/^https?:$/.test(parsed.protocol) && isPayPalHost) target = parsed.href;
-  } catch (_) {
-    target = '';
-  }
-  if (!target) return;
-  paypalRedirectTimer = window.setTimeout(() => {
-    try {
-      if (paypalWindow && !paypalWindow.closed) {
-        paypalWindow.location.href = target;
-        try { paypalWindow.focus?.(); } catch (_) {}
-        return;
-      }
-      const opened = window.open(target, '_blank');
-      if (opened) {
-        paypalWindow = opened;
-        return;
-      }
-      $('roxyStatus').textContent = 'PayPal 页面已生成，请点击“普通浏览器打开”';
-    } catch (_) {
-      $('roxyStatus').textContent = 'PayPal 页面已生成，请点击“普通浏览器打开”';
-    }
-  }, 350);
-}
-function closePayPalWindow(){
-  try { if (paypalWindow && !paypalWindow.closed) paypalWindow.close(); } catch (_) {}
-  paypalWindow = null;
 }
 function startCountdown(expiresAt){
   clearInterval(countdownTimer); const node = $('qrCountdown');
@@ -622,14 +572,13 @@ async function pollBatch(){
     if (active) {
       $('activeLogAccount').textContent = active.email;
       renderLogs(active.logs || []);
-      if (active.justDone && active.result) showResult(active.result, {allowRedirect:batchTasks.length === 1, scroll:false});
+      if (active.justDone && active.result) showResult(active.result, {scroll:false});
       active.justDone = false;
     }
     if (batchTasks.length && batchTasks.every(taskIsTerminal)) {
       clearInterval(batchPollTimer);
       batchPollTimer = 0;
       setRunning(false);
-      if (!batchTasks.some(task => task.status === 'done')) closePayPalWindow();
     }
   } finally {
     batchPollInFlight = false;
@@ -638,14 +587,9 @@ async function pollBatch(){
 
 form.addEventListener('submit', async event => {
   event.preventDefault();
-  clearTimeout(paypalRedirectTimer);
   clearInterval(batchPollTimer);
   batchPollTimer = 0;
-  paypalWindow = null;
   const expectedCount = $('token').value.trim() ? 1 : selectedBatchAccounts().length;
-  if (selected('link_type') === 'paypal' && expectedCount === 1) {
-    try { paypalWindow = window.open('about:blank', '_blank'); } catch (_) { paypalWindow = null; }
-  }
   if (selected('link_type') === 'ph_short') {
     try {
       await loadPhShortProxies(false);
@@ -656,7 +600,7 @@ form.addEventListener('submit', async event => {
       return;
     }
   }
-  if (!roxySessionId) $('resultPanel').hidden = true;
+  $('resultPanel').hidden = true;
   renderedLogKey = '';
   logAutoFollow = true;
   setRunning(true);
@@ -673,7 +617,6 @@ form.addEventListener('submit', async event => {
     if (batchTasks.some(task => !taskIsTerminal(task))) batchPollTimer = setInterval(pollBatch, 1200);
     else setRunning(false);
   } catch (error) {
-    closePayPalWindow();
     batchTasks = [{key:'batch-error', email:'批量任务', status:'error', percent:100, text:'任务创建失败', logs:[{time:'ERROR', message:error.message || String(error)}]}];
     activeTaskKey = batchTasks[0].key;
     renderTaskProgress(); updateBatchSummary(); renderActiveTask();
@@ -686,7 +629,6 @@ $('cancelButton').addEventListener('click', async () => {
   if (!cancellable.length) return;
   clearInterval(batchPollTimer);
   batchPollTimer = 0;
-  closePayPalWindow();
   cancellable.forEach(task => {
     task.status = 'cancelled'; task.percent = 100; task.text = '任务已停止';
   });
@@ -706,67 +648,16 @@ $('returnToPay153').addEventListener('click', () => {
   }
 });
 $('openPaypalProtocol').addEventListener('click', () => {
+  const link = $('resultValue').value.trim();
+  if (!link) return;
+  navigator.clipboard?.writeText(link).catch(() => {});
+  $('paymentStatus').textContent = '正在打开 PayPal 支付并填入当前链接…';
   if (window.self !== window.top) {
-    window.top.postMessage({type: 'paypal-protocol:open'}, window.location.origin);
-  } else {
-    window.location.href = 'http://127.0.0.1:18097/';
+    window.top.postMessage({type: 'paypal-protocol:open', link}, window.location.origin);
+    return;
   }
-});
-
-$('openInRoxy').addEventListener('click', async () => {
-  if (!roxyLaunchToken || roxySessionId) return;
-  const button = $('openInRoxy');
-  button.disabled = true;
-  $('roxyStatus').className = 'roxy-status';
-  $('roxyStatus').textContent = '正在创建 Roxy 临时环境…';
-  try {
-    const response = await fetch('/api/pay153/roxy/open', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({launch_token: roxyLaunchToken})
-    });
-    const data = await response.json();
-    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    roxySessionId = String(data.session_id || '');
-    roxyProfileId = String(data.profile_id || '');
-    button.hidden = true;
-    $('closeRoxy').hidden = false;
-    $('roxyStatus').className = 'roxy-status success';
-    $('roxyStatus').textContent = `Roxy 已打开（环境 ${data.profile_id || '—'}）`;
-  } catch (error) {
-    button.disabled = false;
-    $('roxyStatus').className = 'roxy-status error';
-    $('roxyStatus').textContent = error.message || String(error);
-  }
-});
-
-$('closeRoxy').addEventListener('click', async () => {
-  if (!roxySessionId) return;
-  const button = $('closeRoxy');
-  button.disabled = true;
-  $('roxyStatus').className = 'roxy-status';
-  $('roxyStatus').textContent = '正在关闭并删除 Roxy 临时环境…';
-  try {
-    const response = await fetch('/api/pay153/roxy/close', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: roxySessionId})
-    });
-    const data = await response.json();
-    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    roxySessionId = '';
-    roxyProfileId = '';
-    button.hidden = true;
-    button.disabled = false;
-    $('openInRoxy').hidden = !roxyLaunchToken;
-    $('openInRoxy').disabled = false;
-    $('roxyStatus').className = 'roxy-status success';
-    $('roxyStatus').textContent = 'Roxy 环境已关闭并删除';
-  } catch (error) {
-    button.disabled = false;
-    $('roxyStatus').className = 'roxy-status error';
-    $('roxyStatus').textContent = error.message || String(error);
-  }
+  const target = `http://127.0.0.1:18097/?embedded=1&link=${encodeURIComponent(link)}`;
+  window.location.href = target;
 });
 
 function applyTheme(dark){

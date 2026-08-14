@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="static/styles.css?v=20260814-parallel-2">
+  <link rel="stylesheet" href="static/styles.css?v=20260814-paypal-fill-1">
 </head>
 <body>
   <div class="paper-noise"></div>
@@ -174,17 +174,13 @@
             <div><span>Session</span><code id="resultSession">—</code></div>
           </div>
           <label class="field result-link"><span>最终链接 / 付款码</span><textarea id="resultValue" readonly></textarea></label>
-          <div class="result-actions"><button id="openInRoxy" class="primary-button" type="button" hidden>在 Roxy 打开</button><button id="closeRoxy" class="secondary-button" type="button" hidden>关闭 Roxy</button><a id="openResult" class="secondary-button" target="_blank" rel="noopener noreferrer">普通浏览器打开</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button><button id="returnToPay153" class="secondary-button" type="button">返回提链</button></div>
-          <p id="roxyStatus" class="roxy-status" role="status" aria-live="polite"></p>
+          <div class="result-actions"><button id="openPaypalProtocol" class="primary-button" type="button">PayPal 支付</button><a id="openResult" class="secondary-button" target="_blank" rel="noopener noreferrer">普通浏览器打开</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button><button id="returnToPay153" class="secondary-button" type="button">返回提链</button></div>
+          <p id="paymentStatus" class="payment-status" role="status" aria-live="polite"></p>
         </section>
       </aside>
     </section>
   </main>
 
-  <footer class="preview-footer">
-    <button id="openPaypalProtocol" class="secondary-button" type="button">PayPal 支付</button>
-  </footer>
-
-  <script src="static/app.js?v=20260814-parallel-2"></script>
+  <script src="static/app.js?v=20260814-paypal-fill-1"></script>
 </body>
 </html>

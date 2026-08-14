@@ -82,6 +82,8 @@ test('starts three account jobs concurrently and switches logs by account', asyn
   await waitFor(() => window.document.querySelector('#tokenHint').textContent.includes('3 个账号'));
 
   assert.equal(window.document.querySelector('#parallelCount').value, '3');
+  assert.equal(window.document.querySelector('#openInRoxy'), null);
+  assert.ok(window.document.querySelector('#openPaypalProtocol'));
   window.document.querySelector('#checkoutForm').dispatchEvent(new window.Event('submit', {bubbles:true, cancelable:true}));
 
   await waitFor(() => checkoutBodies.length === 3);
