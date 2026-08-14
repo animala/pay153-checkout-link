@@ -355,14 +355,20 @@ def extract_access_token(raw: str) -> tuple[str, dict]:
         account = data.get("account") or {}
         if isinstance(account, dict):
             meta.update(account)
+        user = data.get("user") or {}
+        if isinstance(user, dict) and not meta.get("email"):
+            meta["email"] = user.get("email") or ""
     if not token:
         match = re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", raw)
         token = match.group(0) if match else raw.splitlines()[0].strip()
     if token.count(".") < 2:
         raise ValueError("Access Token 格式未识别")
     claims = _decode_jwt(token)
+    profile = claims.get("https://api.openai.com/profile") or {}
+    if not isinstance(profile, dict):
+        profile = {}
     meta.update({
-        "email": claims.get("email") or meta.get("email") or "",
+        "email": claims.get("email") or profile.get("email") or meta.get("email") or "",
         "exp": claims.get("exp"),
         "account_id": (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
             or meta.get("id") or "",
@@ -407,6 +413,14 @@ def normalize_proxy(raw: str) -> str:
             auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
         return f"{scheme}://{auth}{host}:{port}"
 
+    def inferred_scheme(host: str) -> str:
+        hostname = str(host or "").strip("[]").lower()
+        if hostname == "1024proxy.io" or hostname.endswith(".1024proxy.io"):
+            # Resolve destination hosts through the upstream proxy. Clash TUN
+            # commonly returns 198.18.0.0/16 fake IPs for local DNS lookups.
+            return "socks5h"
+        return "http"
+
     if "://" in value:
         parsed = urlsplit(value)
         scheme = parsed.scheme.lower()
@@ -426,22 +440,22 @@ def normalize_proxy(raw: str) -> str:
         try:
             username, password = credentials(left)
             host, port = host_port(right)
-            return build("http", host, port, username, password)
+            return build(inferred_scheme(host), host, port, username, password)
         except ValueError:
             host, port = host_port(left)
             username, password = credentials(right)
-            return build("http", host, port, username, password)
+            return build(inferred_scheme(host), host, port, username, password)
 
     parts = value.split(":")
     if len(parts) >= 4 and parts[1].isdigit():
         host, port = host_port(f"{parts[0]}:{parts[1]}")
-        return build("http", host, port, parts[2], ":".join(parts[3:]))
+        return build(inferred_scheme(host), host, port, parts[2], ":".join(parts[3:]))
     if len(parts) >= 4 and parts[-1].isdigit():
         host, port = host_port(f"{parts[-2]}:{parts[-1]}")
-        return build("http", host, port, parts[0], ":".join(parts[1:-2]))
+        return build(inferred_scheme(host), host, port, parts[0], ":".join(parts[1:-2]))
 
     host, port = host_port(value)
-    return build("http", host, port)
+    return build(inferred_scheme(host), host, port)
 
 
 def normalize_proxy_pool(raw: Any, label: str) -> list[str]:

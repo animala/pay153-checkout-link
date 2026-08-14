@@ -1,14 +1,13 @@
 const $ = (id) => document.getElementById(id);
 const form = $('checkoutForm');
 const privateMode = location.pathname.replace(/\/+$/, '') === '/private-checkout';
-let jobId = '';
-let pollTimer = 0;
+let batchTasks = [];
+let batchPollTimer = 0;
+let batchPollInFlight = false;
+let activeTaskKey = '';
 let countdownTimer = 0;
-let displayedProgress = 0;
-let targetProgress = 0;
-let progressStatus = 'idle';
-let progressFrame = 0;
-let progressLastTick = 0;
+let paypalRedirectTimer = 0;
+let paypalWindow = null;
 let proxySaveTimer = 0;
 let logAutoFollow = true;
 let renderedLogKey = '';
@@ -17,6 +16,10 @@ let roxySessionId = '';
 let roxyProfileId = '';
 let phShortProxyLoaded = false;
 let phShortProxyPromise = null;
+let accountLoadVersion = 0;
+let importedAccountToken = '';
+let importedAccount = null;
+let importedAccounts = [];
 
 const PROXY_STORAGE_KEYS = {
   entry: 'pay153.proxy_pool_1',
@@ -84,47 +87,168 @@ bindChoices($('railGrid'), () => {
   if (selected('link_type') === 'ph_short') loadPhShortProxies(true);
 });
 
-async function loadFreeAccountToken(accountId){
-  if (!accountId) return;
-  $('freeAccountSelect').disabled = true;
+function selectedAccountTypes(){
+  return [...document.querySelectorAll('input[name="accountType"]:checked')].map(node => node.value);
+}
+
+function accountTypeLabels(types){
+  const labels = {free:'Free', plus_trial:'Plus 试用', oaics:'OAICS'};
+  return (types || []).map(type => labels[type] || type);
+}
+
+function parallelCount(){
+  const input = $('parallelCount');
+  const value = Math.max(1, Math.min(3, Number(input.value) || 3));
+  input.value = String(value);
+  return value;
+}
+
+function selectedBatchAccounts(){
+  const selectedId = String($('accountSelect').value || '');
+  const primary = importedAccounts.find(item => String(item.id) === selectedId);
+  const ordered = primary
+    ? [primary, ...importedAccounts.filter(item => String(item.id) !== selectedId)]
+    : [...importedAccounts];
+  return ordered.slice(0, parallelCount());
+}
+
+function decodeJwtPayload(token){
   try {
-    const response = await fetch(`/api/pay153/free-accounts/${encodeURIComponent(accountId)}/token`, {cache:'no-store'});
-    const data = await response.json();
-    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    $('token').value = data.access_token || '';
-    $('tokenHint').textContent = `已导入 ${data.email || 'Free 账号'}`;
+    const part = String(token || '').split('.')[1] || '';
+    const padded = part.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - part.length % 4) % 4);
+    const bytes = Uint8Array.from(atob(padded), char => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
   } catch (error) {
-    $('tokenHint').textContent = error.message || String(error);
-  } finally {
-    $('freeAccountSelect').disabled = false;
+    return {};
   }
 }
 
-async function loadFreeAccounts(){
-  const select = $('freeAccountSelect');
-  const refresh = $('refreshFreeAccounts');
+function parseTokenIdentity(raw){
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  let token = '';
+  let meta = {};
+  if (text.startsWith('{')) {
+    try {
+      const data = JSON.parse(text);
+      token = String(data.accessToken || data.access_token || '');
+      meta = data.account && typeof data.account === 'object' ? data.account : {};
+      if (!meta.email && data.user && typeof data.user === 'object') meta.email = data.user.email || '';
+    } catch (error) {
+      return null;
+    }
+  }
+  if (!token) {
+    const match = text.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+    token = match ? match[0] : text.split(/\r?\n/)[0].trim();
+  }
+  if (token.split('.').length < 3) return null;
+  const claims = decodeJwtPayload(token);
+  const auth = claims['https://api.openai.com/auth'] || {};
+  const profile = claims['https://api.openai.com/profile'] || {};
+  return {
+    email: String(claims.email || profile.email || meta.email || ''),
+    accountId: String(auth.chatgpt_account_id || meta.id || ''),
+  };
+}
+
+function setTokenHint(text, state='idle', title=''){
+  const node = $('tokenHint');
+  node.textContent = text;
+  node.className = `account-import-status ${state}`;
+  node.title = title || text;
+}
+
+function updateTokenSourceStatus(fallbackText='未导入账号', fallbackState='idle'){
+  const manual = $('token').value.trim();
+  $('token').required = !importedAccountToken;
+  if (manual) {
+    const identity = parseTokenIdentity(manual);
+    const label = identity?.email || identity?.accountId || '账号信息待提交校验';
+    setTokenHint(`手动 AT：${label}`, 'manual', identity?.email && identity?.accountId ? `${identity.email} · ${identity.accountId}` : label);
+    return;
+  }
+  const batch = selectedBatchAccounts();
+  if (importedAccountToken && importedAccount && batch.length) {
+    const emails = batch.map(item => item.email).filter(Boolean);
+    setTokenHint(`已导入：${batch.length} 个账号`, 'imported', emails.join(' · '));
+    return;
+  }
+  setTokenHint(fallbackText, fallbackState);
+}
+
+function clearImportedAccount(message='未导入账号', state='idle'){
+  importedAccountToken = '';
+  importedAccount = null;
+  updateTokenSourceStatus(message, state);
+}
+
+async function loadAccountToken(accountId, version=accountLoadVersion){
+  if (!accountId) return;
+  const select = $('accountSelect');
+  const types = selectedAccountTypes();
+  select.disabled = true;
+  try {
+    const query = encodeURIComponent(types.join(','));
+    const response = await fetch(`/api/pay153/accounts/${encodeURIComponent(accountId)}/token?types=${query}`, {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    if (version !== accountLoadVersion) return;
+    importedAccountToken = data.access_token || '';
+    importedAccount = data;
+    $('token').value = '';
+    updateTokenSourceStatus();
+  } catch (error) {
+    if (version !== accountLoadVersion) return;
+    clearImportedAccount(error.message || String(error), 'error');
+  } finally {
+    if (version === accountLoadVersion) select.disabled = false;
+  }
+}
+
+async function loadAccounts(){
+  const version = ++accountLoadVersion;
+  const select = $('accountSelect');
+  const refresh = $('refreshAccounts');
+  const types = selectedAccountTypes();
+  clearImportedAccount('正在匹配账号');
+  if (!types.length) {
+    importedAccounts = [];
+    select.innerHTML = '<option value="">请先勾选账号类型</option>';
+    select.disabled = true;
+    updateTokenSourceStatus('请选择 Free、Plus 试用或 OAICS');
+    return;
+  }
   refresh.disabled = true;
   select.disabled = true;
   try {
-    const response = await fetch('/api/pay153/free-accounts', {cache:'no-store'});
+    const response = await fetch(`/api/pay153/accounts?types=${encodeURIComponent(types.join(','))}`, {cache:'no-store'});
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    if (version !== accountLoadVersion) return;
     const items = Array.isArray(data.items) ? data.items : [];
+    importedAccounts = items;
     select.innerHTML = items.length
-      ? items.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.email)} · Free</option>`).join('')
-      : '<option value="">没有可用的 Free 账号</option>';
+      ? items.map(item => {
+          const labels = item.type_labels || accountTypeLabels(item.types);
+          return `<option value="${escapeHtml(item.id)}">${escapeHtml(item.email)} · ${escapeHtml(labels.join(' / '))}</option>`;
+        }).join('')
+      : '<option value="">没有符合条件的账号</option>';
     select.disabled = !items.length;
     if (items.length) {
       select.value = String(data.selected_id || items[0].id);
-      await loadFreeAccountToken(select.value);
+      await loadAccountToken(select.value, version);
     } else {
-      $('tokenHint').textContent = '没有可用的 Free 账号，可手动输入';
+      importedAccounts = [];
+      updateTokenSourceStatus('没有符合条件的账号');
     }
   } catch (error) {
+    if (version !== accountLoadVersion) return;
+    importedAccounts = [];
     select.innerHTML = '<option value="">手动输入 Access Token</option>';
-    $('tokenHint').textContent = error.message || String(error);
+    clearImportedAccount(error.message || String(error), 'error');
   } finally {
-    refresh.disabled = false;
+    if (version === accountLoadVersion) refresh.disabled = false;
   }
 }
 
@@ -198,8 +322,11 @@ $('country').addEventListener('change', () => $('currency').value = countryCurre
 $('usePromo').addEventListener('change', () => syncFields(false));
 $('entryProxy').addEventListener('input', () => { phShortProxyLoaded = false; updateProxyCount($('entryProxy'), $('entryProxyCount')); saveProxyPools(); });
 $('exitProxy').addEventListener('input', () => { phShortProxyLoaded = false; updateProxyCount($('exitProxy'), $('exitProxyCount')); saveProxyPools(); });
-$('freeAccountSelect').addEventListener('change', () => loadFreeAccountToken($('freeAccountSelect').value));
-$('refreshFreeAccounts').addEventListener('click', loadFreeAccounts);
+$('accountSelect').addEventListener('change', () => loadAccountToken($('accountSelect').value));
+$('refreshAccounts').addEventListener('click', loadAccounts);
+document.querySelectorAll('input[name="accountType"]').forEach(node => node.addEventListener('change', loadAccounts));
+$('token').addEventListener('input', () => updateTokenSourceStatus());
+$('parallelCount').addEventListener('change', () => updateTokenSourceStatus());
 $('copyEntryProxy').addEventListener('click', () => {
   $('exitProxy').value = $('entryProxy').value.trim();
   updateProxyCount($('exitProxy'), $('exitProxyCount'));
@@ -207,66 +334,61 @@ $('copyEntryProxy').addEventListener('click', () => {
   $('exitProxy').focus();
 });
 
-function paintProgress(value){
-  const p = Math.max(0, Math.min(100, value));
-  $('progressValue').textContent = `${Math.round(p)}%`;
-  $('orbitValue').style.strokeDashoffset = String(320.44 * (1 - p / 100));
-  $('progressBar').style.width = `${p}%`;
+function taskIsTerminal(task){
+  return ['done', 'error', 'cancelled'].includes(task.status);
 }
-function animateProgress(timestamp){
-  const dt = Math.min(.08, Math.max(.001, (timestamp - (progressLastTick || timestamp)) / 1000));
-  progressLastTick = timestamp;
-  if (progressStatus === 'running' && targetProgress < 96) {
-    targetProgress = Math.min(96, targetProgress + dt * .28);
-  }
-  const diff = targetProgress - displayedProgress;
-  if (Math.abs(diff) > .02) {
-    const rate = progressStatus === 'done' ? 42 : Math.max(7, Math.abs(diff) * 1.35);
-    displayedProgress += Math.sign(diff) * Math.min(Math.abs(diff), rate * dt);
-    paintProgress(displayedProgress);
-  } else {
-    displayedProgress = targetProgress;
-    paintProgress(displayedProgress);
-  }
-  if (progressStatus === 'running' || Math.abs(targetProgress - displayedProgress) > .02) {
-    progressFrame = requestAnimationFrame(animateProgress);
-  } else {
-    progressFrame = 0;
-    progressLastTick = 0;
-  }
+function taskStatusLabel(status){
+  return status === 'done' ? '完成' : status === 'error' ? '异常' : status === 'cancelled' ? '已停止' : status === 'queued' ? '排队中' : status === 'running' ? '运行中' : '创建中';
 }
-function resetProgress(){
-  if (progressFrame) cancelAnimationFrame(progressFrame);
-  displayedProgress = 0;
-  targetProgress = 0;
-  progressStatus = 'idle';
-  progressFrame = 0;
-  progressLastTick = 0;
-  paintProgress(0);
+function taskStatusClass(status){
+  return ['done', 'error', 'cancelled', 'running'].includes(status) ? status : 'queued';
 }
-function setProgress(percent, text, status='running'){
-  const p = Math.max(0, Math.min(100, Number(percent)||0));
-  const retryReset = status === 'running' && p <= 10 && Math.max(displayedProgress, targetProgress) >= 20;
-  if (retryReset) {
-    displayedProgress = p;
-    targetProgress = p;
-    paintProgress(p);
-  } else if (status === 'running') {
-    targetProgress = Math.max(targetProgress, p);
-  } else {
-    targetProgress = p;
+function renderTaskProgress(){
+  const list = $('taskProgressList');
+  if (!batchTasks.length) {
+    list.innerHTML = '<div class="task-progress-empty">选择账号后开始任务</div>';
+    return;
   }
-  progressStatus = status;
-  $('progressText').textContent = text || '处理中';
-  const badge = $('statusBadge'); badge.className = `status-badge ${status}`;
-  badge.textContent = status === 'done' ? '完成' : status === 'error' ? '异常' : status === 'cancelled' ? '已停止' : status === 'queued' ? '排队中' : status === 'running' ? '运行中' : '等待';
-  $('progressStage').textContent = status === 'done' ? '任务完成' : status === 'error' ? '任务异常' : status === 'cancelled' ? '任务已停止' : status === 'queued' ? '等待执行' : status === 'running' ? '正在处理' : '等待开始';
-  if (!progressFrame) progressFrame = requestAnimationFrame(animateProgress);
+  list.innerHTML = batchTasks.map(task => {
+    const percent = Math.max(0, Math.min(100, Number(task.percent) || 0));
+    const statusClass = taskStatusClass(task.status);
+    return `<button class="task-progress-item ${statusClass}${task.key === activeTaskKey ? ' active' : ''}" type="button" data-task-key="${escapeHtml(task.key)}">
+      <span class="task-progress-head"><strong>${escapeHtml(task.email || '手动账号')}</strong><span>${taskStatusLabel(task.status)} · ${Math.round(percent)}%</span></span>
+      <span class="task-progress-bar" aria-hidden="true"><i style="width:${percent}%"></i></span>
+      <span class="task-progress-meta"><span>${escapeHtml(task.text || '等待提交')}</span><span>${task.queuePosition > 0 ? `队列 ${task.queuePosition}` : ''}</span></span>
+    </button>`;
+  }).join('');
+}
+function updateBatchSummary(){
+  const badge = $('statusBadge');
+  if (!batchTasks.length) {
+    badge.className = 'status-badge idle';
+    badge.textContent = '等待';
+    return;
+  }
+  const total = batchTasks.length;
+  const running = batchTasks.filter(task => !taskIsTerminal(task)).length;
+  const done = batchTasks.filter(task => task.status === 'done').length;
+  const failed = batchTasks.filter(task => task.status === 'error').length;
+  const cancelled = batchTasks.filter(task => task.status === 'cancelled').length;
+  let status = 'running';
+  let text = `运行 ${running}/${total}`;
+  if (running === 0 && failed > 0) { status = 'error'; text = `异常 ${failed}/${total}`; }
+  else if (running === 0 && done === total) { status = 'done'; text = `完成 ${done}/${total}`; }
+  else if (running === 0 && cancelled === total) { status = 'cancelled'; text = '已停止'; }
+  else if (running === 0) { status = 'done'; text = `结束 ${done}/${total}`; }
+  badge.className = `status-badge ${status}`;
+  badge.textContent = text;
 }
 function renderLogs(logs){
   const box = $('logBox');
-  if (!logs?.length) return;
-  const nextKey = logs.map(x => `${x.time}|${x.message}`).join('\n');
+  if (!logs?.length) {
+    const emptyKey = `${activeTaskKey}|empty`;
+    if (renderedLogKey !== emptyKey) box.innerHTML = '<div class="empty-log">该账号暂无日志。</div>';
+    renderedLogKey = emptyKey;
+    return;
+  }
+  const nextKey = `${activeTaskKey}|${logs.map(x => `${x.time}|${x.message}`).join('\n')}`;
   if (nextKey === renderedLogKey) return;
   const previousTop = box.scrollTop;
   const wasFollowing = logAutoFollow;
@@ -276,13 +398,40 @@ function renderLogs(logs){
   else box.scrollTop = previousTop;
 }
 function escapeHtml(v){ return String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
-function setRunning(running){ $('submitButton').disabled = running; $('cancelButton').hidden = !running; }
+function renderActiveTask(allowRedirect=false){
+  const task = batchTasks.find(item => item.key === activeTaskKey);
+  $('activeLogAccount').textContent = task?.email || '等待任务';
+  renderedLogKey = '';
+  renderLogs(task?.logs || []);
+  if (task?.result) showResult(task.result, {allowRedirect, scroll:false});
+  else $('resultPanel').hidden = true;
+}
+function selectTask(taskKey){
+  if (!batchTasks.some(task => task.key === taskKey)) return;
+  activeTaskKey = taskKey;
+  renderTaskProgress();
+  renderActiveTask(false);
+}
+function setRunning(running){
+  $('submitButton').disabled = running;
+  $('cancelButton').hidden = !running;
+  $('parallelCount').disabled = running;
+  $('accountSelect').disabled = running || !importedAccounts.length;
+  $('refreshAccounts').disabled = running;
+  $('token').disabled = running;
+  document.querySelectorAll('input[name="accountType"]').forEach(node => { node.disabled = running; });
+}
+$('taskProgressList').addEventListener('click', event => {
+  const button = event.target.closest('[data-task-key]');
+  if (button) selectTask(button.dataset.taskKey);
+});
 $('logBox').addEventListener('scroll', () => {
   const box = $('logBox');
   logAutoFollow = box.scrollHeight - box.clientHeight - box.scrollTop < 28;
 });
 
-function showResult(result){
+function showResult(result, {allowRedirect=false, scroll=false}={}){
+  clearTimeout(paypalRedirectTimer);
   $('resultPanel').hidden = false;
   $('resultType').textContent = `${String(result.plan||'').toUpperCase()} · ${String(result.link_type||'').toUpperCase()}`;
   $('resultEmail').textContent = result.account_email || '—';
@@ -321,7 +470,45 @@ function showResult(result){
   $('qrWrap').hidden = !qr;
   if (qr) $('qrImage').src = qr;
   startCountdown(result.expires_at);
-  $('resultPanel').scrollIntoView({behavior:'smooth',block:'nearest'});
+  if (scroll) $('resultPanel').scrollIntoView({behavior:'smooth',block:'nearest'});
+  if (allowRedirect) schedulePayPalRedirect(result);
+}
+function schedulePayPalRedirect(result){
+  const provider = String(result.link_type || result.provider || '').toLowerCase();
+  if (provider !== 'paypal') return;
+  const rawUrl = result.paypal_link || result.paypal_url || result.provider_redirect_url || result.checkout_url || '';
+  let target = '';
+  try {
+    const parsed = new URL(String(rawUrl).trim(), window.location.href);
+    const host = parsed.hostname.toLowerCase();
+    const isPayPalHost = host === 'paypal.com' || host.endsWith('.paypal.com')
+      || host === 'paypalobjects.com' || host.endsWith('.paypalobjects.com');
+    if (/^https?:$/.test(parsed.protocol) && isPayPalHost) target = parsed.href;
+  } catch (_) {
+    target = '';
+  }
+  if (!target) return;
+  paypalRedirectTimer = window.setTimeout(() => {
+    try {
+      if (paypalWindow && !paypalWindow.closed) {
+        paypalWindow.location.href = target;
+        try { paypalWindow.focus?.(); } catch (_) {}
+        return;
+      }
+      const opened = window.open(target, '_blank');
+      if (opened) {
+        paypalWindow = opened;
+        return;
+      }
+      $('roxyStatus').textContent = 'PayPal 页面已生成，请点击“普通浏览器打开”';
+    } catch (_) {
+      $('roxyStatus').textContent = 'PayPal 页面已生成，请点击“普通浏览器打开”';
+    }
+  }, 350);
+}
+function closePayPalWindow(){
+  try { if (paypalWindow && !paypalWindow.closed) paypalWindow.close(); } catch (_) {}
+  paypalWindow = null;
 }
 function startCountdown(expiresAt){
   clearInterval(countdownTimer); const node = $('qrCountdown');
@@ -330,37 +517,34 @@ function startCountdown(expiresAt){
   render(); countdownTimer=setInterval(render,1000);
 }
 
-async function poll(){
-  if (!jobId) return;
-  try{
-    const r = await fetch(`api/checkout-progress?job_id=${encodeURIComponent(jobId)}`, {cache:'no-store'});
-    const data = await r.json(); if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-    setProgress(data.percent, data.text, data.status);
-    renderLogs(data.logs);
-    if (data.status === 'done') { clearInterval(pollTimer); setRunning(false); showResult(data.result || {}); }
-    if (data.status === 'error' || data.status === 'cancelled') { clearInterval(pollTimer); setRunning(false); if(data.error) renderLogs([...(data.logs||[]),{time:'ERROR',message:data.error}]); }
-  }catch(e){ clearInterval(pollTimer); setRunning(false); setProgress(100, e.message || String(e), 'error'); }
+async function resolveLaunchAccounts(){
+  const manualToken = $('token').value.trim();
+  if (manualToken) {
+    const identity = parseTokenIdentity(manualToken);
+    return [{
+      key: `manual-${Date.now()}`,
+      email: identity?.email || identity?.accountId || '手动账号',
+      token: manualToken,
+    }];
+  }
+  const selectedItems = selectedBatchAccounts();
+  if (!selectedItems.length) throw new Error('没有符合当前筛选条件的账号');
+  const query = encodeURIComponent(selectedAccountTypes().join(','));
+  return Promise.all(selectedItems.map(async item => {
+    if (importedAccountToken && String(importedAccount?.id) === String(item.id)) {
+      return {key:`account-${item.id}`, email:item.email || '匹配账号', token:importedAccountToken};
+    }
+    const response = await fetch(`/api/pay153/accounts/${encodeURIComponent(item.id)}/token?types=${query}`, {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(`${item.email || '账号'}：${data.error || `HTTP ${response.status}`}`);
+    return {key:`account-${item.id}`, email:data.email || item.email || '匹配账号', token:data.access_token || ''};
+  }));
 }
 
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  if (selected('link_type') === 'ph_short') {
-    try {
-      await loadPhShortProxies(false);
-    } catch (error) {
-      setProgress(100, error.message || String(error), 'error');
-      return;
-    }
-  }
-  if (!roxySessionId) $('resultPanel').hidden = true;
-  $('logBox').innerHTML = '<div class="empty-log">正在创建任务…</div>';
-  renderedLogKey = '';
-  logAutoFollow = true;
-  resetProgress();
-  setRunning(true); setProgress(3, '提交任务', 'running');
+function checkoutBody(token){
   const plan = selected('plan');
-  const body = {
-    token: $('token').value, plan, link_type: selected('link_type'), country: $('country').value,
+  return {
+    token, plan, link_type: selected('link_type'), country: $('country').value,
     currency: $('currency').value, entry_proxies: proxyLines($('entryProxy')), exit_proxies: proxyLines($('exitProxy')),
     retry_count: Math.max(1, Math.min(50, Number($('retryCount').value || 10))),
     use_sen: $('useSentinel').checked,
@@ -375,25 +559,159 @@ form.addEventListener('submit', async (event) => {
     pix_tax_id: selected('link_type') === 'pix' ? $('pixTaxId').value.trim() : '',
     pix_auto_kind: selected('link_type') === 'pix' ? $('pixAutoKind').value : 'cpf'
   };
-  try{
-    const r = await fetch('api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const data = await r.json(); if(!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-    jobId = data.job_id;
-    if (data.internal) setProgress(4, '私有直通任务已进入独立执行池', 'running');
-    else if (data.queue_position > 0) setProgress(2, `任务已进入队列，当前第 ${data.queue_position} 位`, 'queued');
-    clearInterval(pollTimer); await poll(); pollTimer=setInterval(poll,1200);
-  }catch(e){ setRunning(false); setProgress(100,e.message||String(e),'error'); }
+}
+
+async function startBatchTask(task){
+  try {
+    const response = await fetch('api/checkout', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(checkoutBody(task.token))
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    task.jobId = data.job_id;
+    task.status = data.queue_position > 0 ? 'queued' : 'running';
+    task.percent = data.queue_position > 0 ? 2 : 4;
+    task.queuePosition = Number(data.queue_position) || 0;
+    task.text = data.queue_position > 0 ? `任务已进入队列，当前第 ${data.queue_position} 位` : '任务已提交';
+  } catch (error) {
+    task.status = 'error';
+    task.percent = 100;
+    task.text = '创建任务失败';
+    task.error = error.message || String(error);
+    task.logs = [{time:'ERROR', message:task.error}];
+  } finally {
+    task.token = '';
+  }
+}
+
+async function pollBatchTask(task){
+  if (!task.jobId || taskIsTerminal(task)) return;
+  try {
+    const response = await fetch(`api/checkout-progress?job_id=${encodeURIComponent(task.jobId)}`, {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const previousStatus = task.status;
+    task.status = data.status || 'running';
+    task.percent = Math.max(0, Math.min(100, Number(data.percent) || 0));
+    task.text = data.text || '处理中';
+    task.logs = Array.isArray(data.logs) ? data.logs : [];
+    task.result = data.result || null;
+    task.error = data.error || '';
+    task.queuePosition = Number(data.queue_position) || 0;
+    task.justDone = previousStatus !== 'done' && task.status === 'done';
+    if (task.status === 'error' && task.error && !task.logs.some(row => row.message === task.error)) {
+      task.logs = [...task.logs, {time:'ERROR', message:task.error}];
+    }
+  } catch (error) {
+    task.status = 'error';
+    task.percent = 100;
+    task.text = '读取任务状态失败';
+    task.error = error.message || String(error);
+    task.logs = [...(task.logs || []), {time:'ERROR', message:task.error}];
+  }
+}
+
+async function pollBatch(){
+  if (batchPollInFlight) return;
+  batchPollInFlight = true;
+  try {
+    await Promise.all(batchTasks.map(pollBatchTask));
+    renderTaskProgress();
+    updateBatchSummary();
+    const active = batchTasks.find(task => task.key === activeTaskKey);
+    if (active) {
+      $('activeLogAccount').textContent = active.email;
+      renderLogs(active.logs || []);
+      if (active.justDone && active.result) showResult(active.result, {allowRedirect:batchTasks.length === 1, scroll:false});
+      active.justDone = false;
+    }
+    if (batchTasks.length && batchTasks.every(taskIsTerminal)) {
+      clearInterval(batchPollTimer);
+      batchPollTimer = 0;
+      setRunning(false);
+      if (!batchTasks.some(task => task.status === 'done')) closePayPalWindow();
+    }
+  } finally {
+    batchPollInFlight = false;
+  }
+}
+
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  clearTimeout(paypalRedirectTimer);
+  clearInterval(batchPollTimer);
+  batchPollTimer = 0;
+  paypalWindow = null;
+  const expectedCount = $('token').value.trim() ? 1 : selectedBatchAccounts().length;
+  if (selected('link_type') === 'paypal' && expectedCount === 1) {
+    try { paypalWindow = window.open('about:blank', '_blank'); } catch (_) { paypalWindow = null; }
+  }
+  if (selected('link_type') === 'ph_short') {
+    try {
+      await loadPhShortProxies(false);
+    } catch (error) {
+      batchTasks = [{key:'proxy-error', email:'代理配置', status:'error', percent:100, text:'代理读取失败', logs:[{time:'ERROR', message:error.message || String(error)}]}];
+      activeTaskKey = batchTasks[0].key;
+      renderTaskProgress(); updateBatchSummary(); renderActiveTask();
+      return;
+    }
+  }
+  if (!roxySessionId) $('resultPanel').hidden = true;
+  renderedLogKey = '';
+  logAutoFollow = true;
+  setRunning(true);
+  try {
+    const accounts = await resolveLaunchAccounts();
+    batchTasks = accounts.map(account => ({
+      ...account, jobId:'', status:'creating', percent:3, text:'正在创建任务', logs:[], result:null, error:'', queuePosition:0
+    }));
+    activeTaskKey = batchTasks[0]?.key || '';
+    renderTaskProgress(); updateBatchSummary(); renderActiveTask();
+    await Promise.all(batchTasks.map(startBatchTask));
+    renderTaskProgress(); updateBatchSummary(); renderActiveTask();
+    await pollBatch();
+    if (batchTasks.some(task => !taskIsTerminal(task))) batchPollTimer = setInterval(pollBatch, 1200);
+    else setRunning(false);
+  } catch (error) {
+    closePayPalWindow();
+    batchTasks = [{key:'batch-error', email:'批量任务', status:'error', percent:100, text:'任务创建失败', logs:[{time:'ERROR', message:error.message || String(error)}]}];
+    activeTaskKey = batchTasks[0].key;
+    renderTaskProgress(); updateBatchSummary(); renderActiveTask();
+    setRunning(false);
+  }
 });
 
 $('cancelButton').addEventListener('click', async () => {
-  if(!jobId) return;
-  setRunning(false);
-  setProgress(100,'任务已停止','cancelled');
-  await fetch('api/checkout-cancel',{
-    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:jobId})
+  const cancellable = batchTasks.filter(task => task.jobId && !taskIsTerminal(task));
+  if (!cancellable.length) return;
+  clearInterval(batchPollTimer);
+  batchPollTimer = 0;
+  closePayPalWindow();
+  cancellable.forEach(task => {
+    task.status = 'cancelled'; task.percent = 100; task.text = '任务已停止';
   });
+  renderTaskProgress(); updateBatchSummary(); renderActiveTask(); setRunning(false);
+  await Promise.allSettled(cancellable.map(task => fetch('api/checkout-cancel', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job_id:task.jobId})
+  })));
 });
 $('copyResult').addEventListener('click', async () => { await navigator.clipboard.writeText($('resultValue').value || ''); const old=$('copyResult').textContent; $('copyResult').textContent='已复制'; setTimeout(()=>$('copyResult').textContent=old,1200); });
+$('returnToPay153').addEventListener('click', () => {
+  if (window.self !== window.top) {
+    window.top.postMessage({type: 'pay153:return'}, window.location.origin);
+  } else if (window.history.length > 1) {
+    window.history.back();
+  } else {
+    window.location.href = '/';
+  }
+});
+$('openPaypalProtocol').addEventListener('click', () => {
+  if (window.self !== window.top) {
+    window.top.postMessage({type: 'paypal-protocol:open'}, window.location.origin);
+  } else {
+    window.location.href = 'http://127.0.0.1:18097/';
+  }
+});
 
 $('openInRoxy').addEventListener('click', async () => {
   if (!roxyLaunchToken || roxySessionId) return;
@@ -480,4 +798,4 @@ syncFields(true);
 restoreProxyPools();
 updateProxyCount($('entryProxy'), $('entryProxyCount'));
 updateProxyCount($('exitProxy'), $('exitProxyCount'));
-loadFreeAccounts();
+loadAccounts();

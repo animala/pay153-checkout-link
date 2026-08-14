@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="static/styles.css?v=20260813-account-proxy-1">
+  <link rel="stylesheet" href="static/styles.css?v=20260814-parallel-2">
 </head>
 <body>
   <div class="paper-noise"></div>
@@ -14,13 +14,24 @@
     <section class="workspace-grid">
       <form id="checkoutForm" class="panel form-panel">
         <div class="field token-field">
-          <span class="label-row"><b>Access Token / Session JSON</b><small id="tokenHint">自动识别账号信息</small></span>
-          <div class="account-import-row">
-            <select id="freeAccountSelect" aria-label="Free 套餐账号"><option value="">正在读取 Free 账号…</option></select>
-            <button id="refreshFreeAccounts" class="icon-button" type="button" title="刷新 Free 账号" aria-label="刷新 Free 账号">↻</button>
+          <span class="label-row"><b>Access Token / Session JSON</b><small id="tokenHint" class="account-import-status idle">未导入账号</small></span>
+          <div class="account-control-row">
+            <div class="account-type-filters" role="group" aria-label="自动导入账号类型" title="多选时账号需同时满足全部条件">
+              <span class="account-type-title">自动导入</span>
+              <label class="account-type-option"><input type="checkbox" name="accountType" value="free"><span>Free</span></label>
+              <label class="account-type-option"><input type="checkbox" name="accountType" value="plus_trial" checked><span>Plus 试用</span></label>
+              <label class="account-type-option"><input type="checkbox" name="accountType" value="oaics"><span>OAICS</span></label>
+            </div>
+            <label class="parallel-setting" for="parallelCount">
+              <span>并行数</span>
+              <input id="parallelCount" type="number" min="1" max="3" step="1" value="3" inputmode="numeric">
+            </label>
           </div>
-          <textarea id="token" name="token" required autocomplete="off" spellcheck="false" placeholder="粘贴 Access Token，或 chatgpt.com/api/auth/session 返回的 JSON"></textarea>
-          <span class="field-note">内容不写入数据库，服务日志会自动隐藏 Token。</span>
+          <div class="account-import-row">
+            <select id="accountSelect" aria-label="符合筛选条件的账号"><option value="">正在读取 Plus 试用账号…</option></select>
+            <button id="refreshAccounts" class="icon-button" type="button" title="刷新匹配账号" aria-label="刷新匹配账号">↻</button>
+          </div>
+          <textarea id="token" name="token" required autocomplete="off" spellcheck="false" placeholder="手动测试：粘贴 Access Token 或 Session JSON"></textarea>
         </div>
 
         <fieldset class="field-group">
@@ -138,18 +149,17 @@
           <p class="inline-note">留空税号时，每轮自动生成新的 CPF 或 CNPJ，并同步生成持有人/企业名称、邮箱和巴西地址。填写固定 CNPJ 时会优先查询登记资料。</p>
         </div>
 
-        <div class="form-actions">
-          <button id="submitButton" class="primary-button" type="submit"><span>开始提炼</span><i>→</i></button>
-          <button id="cancelButton" class="secondary-button" type="button" hidden>停止任务</button>
-        </div>
       </form>
 
       <aside class="right-stack">
+        <div class="launch-actions">
+          <button id="submitButton" class="primary-button" type="submit" form="checkoutForm"><span>开始提炼</span><i>→</i></button>
+          <button id="cancelButton" class="secondary-button" type="button" hidden>停止全部</button>
+        </div>
         <section class="panel status-panel">
           <div class="panel-heading"><div><span class="section-index">B</span><h2>运行状态</h2></div><span id="statusBadge" class="status-badge idle">等待</span></div>
-          <div class="progress-orbit"><svg viewBox="0 0 120 120"><circle class="orbit-bg" cx="60" cy="60" r="51"></circle><circle id="orbitValue" class="orbit-value" cx="60" cy="60" r="51"></circle></svg><div><strong id="progressValue">0%</strong><span id="progressText">尚未创建任务</span></div></div>
-          <div class="progress-track" aria-hidden="true"><i id="progressBar"></i></div>
-          <div class="progress-caption"><span>任务进度</span><b id="progressStage">等待开始</b></div>
+          <div id="taskProgressList" class="task-progress-list"><div class="task-progress-empty">选择账号后开始任务</div></div>
+          <div class="selected-log-heading"><span>当前日志</span><b id="activeLogAccount">等待任务</b></div>
           <div id="logBox" class="log-box"><div class="empty-log">任务日志将在这里实时出现。</div></div>
         </section>
 
@@ -164,13 +174,17 @@
             <div><span>Session</span><code id="resultSession">—</code></div>
           </div>
           <label class="field result-link"><span>最终链接 / 付款码</span><textarea id="resultValue" readonly></textarea></label>
-          <div class="result-actions"><button id="openInRoxy" class="primary-button" type="button" hidden>在 Roxy 打开</button><button id="closeRoxy" class="secondary-button" type="button" hidden>关闭 Roxy</button><a id="openResult" class="secondary-button" target="_blank" rel="noopener noreferrer">普通浏览器打开</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button></div>
+          <div class="result-actions"><button id="openInRoxy" class="primary-button" type="button" hidden>在 Roxy 打开</button><button id="closeRoxy" class="secondary-button" type="button" hidden>关闭 Roxy</button><a id="openResult" class="secondary-button" target="_blank" rel="noopener noreferrer">普通浏览器打开</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button><button id="returnToPay153" class="secondary-button" type="button">返回提链</button></div>
           <p id="roxyStatus" class="roxy-status" role="status" aria-live="polite"></p>
         </section>
       </aside>
     </section>
   </main>
 
-  <script src="static/app.js?v=20260813-account-proxy-1"></script>
+  <footer class="preview-footer">
+    <button id="openPaypalProtocol" class="secondary-button" type="button">PayPal 支付</button>
+  </footer>
+
+  <script src="static/app.js?v=20260814-parallel-2"></script>
 </body>
 </html>
