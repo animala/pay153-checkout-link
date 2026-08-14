@@ -638,6 +638,40 @@ $('cancelButton').addEventListener('click', async () => {
   })));
 });
 $('copyResult').addEventListener('click', async () => { await navigator.clipboard.writeText($('resultValue').value || ''); const old=$('copyResult').textContent; $('copyResult').textContent='已复制'; setTimeout(()=>$('copyResult').textContent=old,1200); });
+function historyStatusLabel(status){
+  return ({done:'完成', error:'失败', cancelled:'已停止', running:'运行中', queued:'排队中'}[String(status || '').toLowerCase()] || '未知');
+}
+function historyTime(value){
+  const timestamp = Number(value || 0);
+  return timestamp ? new Date(timestamp * 1000).toLocaleString([], {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}) : '历史记录';
+}
+function renderHistory(items){
+  const list = $('historyList');
+  if (!list) return;
+  if (!Array.isArray(items) || !items.length) {
+    list.innerHTML = '<div class="history-empty">暂无历史提链记录</div>';
+    return;
+  }
+  list.innerHTML = items.map(item => {
+    const status = String(item.status || '').toLowerCase();
+    const title = item.account_email || item.link_type || item.id || '提链任务';
+    const detail = [item.plan, item.link_type, item.country && item.currency ? `${item.country}/${item.currency}` : item.country].filter(Boolean).join(' · ');
+    const error = item.error ? `<div class="history-item-error">${escapeHtml(item.error)}</div>` : '';
+    return `<article class="history-item"><div class="history-item-head"><strong title="${escapeHtml(title)}">${escapeHtml(title)}</strong><span class="history-status ${escapeHtml(status)}">${historyStatusLabel(status)}</span></div><div class="history-item-meta"><span>${escapeHtml(detail || item.text || '')}</span><time>${escapeHtml(historyTime(item.updated_at || item.created_at))}</time></div>${error}</article>`;
+  }).join('');
+}
+async function loadHistory(){
+  try {
+    const response = await fetch('api/checkout-history?limit=30', {cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    renderHistory(data.items || []);
+  } catch (_) {
+    const list = $('historyList');
+    if (list && !list.children.length) list.innerHTML = '<div class="history-empty">历史状态暂不可用</div>';
+  }
+}
+$('refreshHistory').addEventListener('click', loadHistory);
 $('returnToPay153').addEventListener('click', () => {
   if (window.self !== window.top) {
     window.top.postMessage({type: 'pay153:return'}, window.location.origin);
@@ -690,3 +724,5 @@ restoreProxyPools();
 updateProxyCount($('entryProxy'), $('entryProxyCount'));
 updateProxyCount($('exitProxy'), $('exitProxyCount'));
 loadAccounts();
+loadHistory();
+window.setInterval(loadHistory, 5000);

@@ -15,6 +15,7 @@ import unicodedata
 import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -39,6 +40,8 @@ from ph_short_extractor import (
 ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
 RUST_ALIAS_FILE = ROOT / "data" / "rust_job_aliases.json"
+CHECKOUT_HISTORY_FILE = ROOT / "data" / "checkout_history.jsonl"
+SUCCESS_LINKS_FILE = ROOT / "data" / "success_links.jsonl"
 RUST_ALIAS_LOCK = threading.RLock()
 LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
 UPI_ENABLED = str(os.getenv("PAY153_UPI_ENABLED", "0")).strip().lower() in {
@@ -1361,7 +1364,7 @@ class JobStore:
                 "currency": result.get("checkout_currency") or result.get("currency") or "",
                 "url": result.get("provider_redirect_url") or result.get("paypal_link") or result.get("url") or result.get("link") or result.get("checkout_url") or "",
             }
-            path = ROOT / "data" / "success_links.jsonl"
+            path = SUCCESS_LINKS_FILE
             with self.file_lock:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as handle:
@@ -1369,6 +1372,121 @@ class JobStore:
                 path.chmod(0o600)
         except Exception:
             pass
+
+    @staticmethod
+    def _history_snapshot(job: dict) -> dict:
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        error = re.sub(r"eyJ[A-Za-z0-9_.-]{40,}", "[TOKEN]", str(job.get("error") or ""))
+        return {
+            "id": str(job.get("id") or ""),
+            "status": str(job.get("status") or ""),
+            "percent": int(job.get("percent") or 0),
+            "text": str(job.get("text") or ""),
+            "error": error[:1200],
+            "created_at": float(job.get("created_at") or 0),
+            "updated_at": float(job.get("updated_at") or 0),
+            "account_email": str(result.get("account_email") or ""),
+            "plan": str(result.get("plan") or ""),
+            "link_type": str(result.get("link_type") or ""),
+            "country": str(result.get("country") or result.get("checkout_country") or ""),
+            "currency": str(result.get("currency") or result.get("checkout_currency") or ""),
+            "url": str(
+                result.get("short_link") or result.get("provider_redirect_url")
+                or result.get("paypal_link") or result.get("url") or result.get("link")
+                or result.get("checkout_url") or ""
+            ),
+        }
+
+    def _append_history(self, record: dict) -> None:
+        try:
+            CHECKOUT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with self.file_lock:
+                with CHECKOUT_HISTORY_FILE.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def history(self, limit: int = 30) -> list[dict]:
+        limit = max(1, min(100, int(limit or 30)))
+        records: dict[str, dict] = {}
+        for path in (CHECKOUT_HISTORY_FILE, SUCCESS_LINKS_FILE):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()[-limit * 3:]
+            except Exception:
+                continue
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                job_id = str(item.get("id") or item.get("job_id") or "")
+                if not job_id:
+                    continue
+                if "recorded_at" in item and "status" not in item:
+                    item = {
+                        "id": job_id,
+                        "status": "done",
+                        "percent": 100,
+                        "text": "提链完成",
+                        "error": "",
+                        "created_at": 0,
+                        "updated_at": 0,
+                        "account_email": item.get("account_email") or "",
+                        "plan": "",
+                        "link_type": item.get("link_type") or "",
+                        "country": item.get("combination") or "",
+                        "currency": item.get("currency") or "",
+                        "url": item.get("url") or "",
+                    }
+                records[job_id] = item
+        # Recover terminal states written by older service versions before
+        # checkout_history.jsonl was introduced.
+        try:
+            for path in BACKEND_LOG_DIR.glob("*/*.log"):
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                terminal = next(
+                    (line for line in reversed(lines) if re.search(r"status=(done|error|cancelled)\b", line)),
+                    "",
+                )
+                if not terminal:
+                    continue
+                match = re.search(r"status=(done|error|cancelled)\s+percent=(\d+)\s+text=(.*)$", terminal)
+                if not match:
+                    continue
+                timestamp = 0.0
+                if lines:
+                    try:
+                        timestamp = datetime.fromisoformat(lines[0][:19]).timestamp()
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                error = next((line.split("[DETAIL]", 1)[-1].strip() for line in reversed(lines) if "[DETAIL]" in line and "错误" in line), "")
+                records[path.stem] = {
+                    "id": path.stem,
+                    "status": match.group(1),
+                    "percent": int(match.group(2)),
+                    "text": match.group(3),
+                    "error": error[:1200],
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                    "account_email": "",
+                    "plan": "",
+                    "link_type": "",
+                    "country": "",
+                    "currency": "",
+                    "url": "",
+                }
+        except Exception:
+            pass
+        with self.lock:
+            for job in self.jobs.values():
+                snapshot = self._history_snapshot(job)
+                if snapshot["id"]:
+                    records[snapshot["id"]] = snapshot
+        return sorted(
+            records.values(),
+            key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0),
+            reverse=True,
+        )[:limit]
 
     def _refresh_queue_locked(self):
         for position, (job_id, _options) in enumerate(self.pending, 1):
@@ -1442,6 +1560,7 @@ class JobStore:
                 "id": job_id, "status": "queued", "percent": 2, "text": "任务已创建",
                 "logs": [], "result": None, "error": "", "last_retry_error": "", "cancel": False,
                 "created_at": now, "updated_at": now, "queue_position": 0, "dispatched": False,
+                "_history_recorded": False,
             }
             options = dict(options)
             options["_internal_request"] = bool(internal)
@@ -1471,6 +1590,7 @@ class JobStore:
 
     def update(self, job_id: str, **fields):
         backend_line = ""
+        history_record = None
         with self.lock:
             job = self.jobs.get(job_id)
             if not job:
@@ -1487,8 +1607,13 @@ class JobStore:
                 return
             job.update(fields)
             job["updated_at"] = time.time()
+            if job.get("status") in {"done", "error", "cancelled"} and not job.get("_history_recorded"):
+                job["_history_recorded"] = True
+                history_record = self._history_snapshot(job)
             if "text" in fields or "status" in fields:
                 backend_line = f"status={job.get('status')} percent={job.get('percent')} text={job.get('text')}"
+        if history_record:
+            self._append_history(history_record)
         if backend_line:
             self._append_backend_log(job_id, "STATUS", backend_line)
 
@@ -1570,6 +1695,7 @@ class JobStore:
             return dict(context)
 
     def cancel(self, job_id: str) -> bool:
+        history_record = None
         with self.condition:
             if job_id not in self.jobs:
                 return False
@@ -1592,8 +1718,13 @@ class JobStore:
                 )
                 self._append_backend_log(job_id, "STATUS", "status=cancelled percent=100 text=任务已停止")
             job["updated_at"] = time.time()
+            if not job.get("_history_recorded"):
+                job["_history_recorded"] = True
+                history_record = self._history_snapshot(job)
             self.condition.notify_all()
-            return True
+        if history_record:
+            self._append_history(history_record)
+        return True
 
     def cancelled(self, job_id: str) -> bool:
         with self.lock:
@@ -3495,6 +3626,15 @@ def checkout_progress():
                 pass
         return jsonify({"error": "任务不存在"}), 404
     return jsonify(job)
+
+
+@app.get("/api/checkout-history")
+def checkout_history():
+    try:
+        limit = min(100, max(1, int(request.args.get("limit") or 30)))
+    except (TypeError, ValueError):
+        limit = 30
+    return jsonify({"ok": True, "items": STORE.history(limit)})
 
 
 @app.post("/api/checkout-cancel")

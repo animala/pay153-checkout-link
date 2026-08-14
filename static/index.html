@@ -163,6 +163,11 @@
           <div id="logBox" class="log-box"><div class="empty-log">任务日志将在这里实时出现。</div></div>
         </section>
 
+        <section class="panel history-panel">
+          <div class="panel-heading"><div><span class="section-index">H</span><h2>历史提链状态</h2></div><button id="refreshHistory" class="icon-button" type="button" title="刷新历史状态" aria-label="刷新历史状态">↻</button></div>
+          <div id="historyList" class="history-list"><div class="history-empty">正在读取历史状态…</div></div>
+        </section>
+
         <section id="resultPanel" class="panel result-panel" hidden>
           <div class="panel-heading"><div><span class="section-index">C</span><h2>提炼结果</h2></div><span class="seal">READY</span></div>
           <div id="qrWrap" class="qr-wrap" hidden><img id="qrImage" alt="支付二维码"><span id="qrCountdown"></span></div>
