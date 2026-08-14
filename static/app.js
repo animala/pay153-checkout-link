@@ -645,14 +645,22 @@ function historyTime(value){
   const timestamp = Number(value || 0);
   return timestamp ? new Date(timestamp * 1000).toLocaleString([], {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}) : '历史记录';
 }
+const HISTORY_CLEAR_KEY = 'pay153.historyClearedAt.v1';
+function historyClearedAt(){
+  return Number(window.localStorage.getItem(HISTORY_CLEAR_KEY) || 0);
+}
 function renderHistory(items){
   const list = $('historyList');
   if (!list) return;
-  if (!Array.isArray(items) || !items.length) {
+  const clearedAt = historyClearedAt();
+  const visibleItems = Array.isArray(items) ? items.filter(item => {
+    return Math.max(Number(item.updated_at || 0), Number(item.created_at || 0)) > clearedAt;
+  }) : [];
+  if (!visibleItems.length) {
     list.innerHTML = '<div class="history-empty">暂无历史提链记录</div>';
     return;
   }
-  list.innerHTML = items.map(item => {
+  list.innerHTML = visibleItems.map(item => {
     const status = String(item.status || '').toLowerCase();
     const title = item.account_email || item.link_type || item.id || '提链任务';
     const detail = [item.plan, item.link_type, item.country && item.currency ? `${item.country}/${item.currency}` : item.country].filter(Boolean).join(' · ');
@@ -671,6 +679,28 @@ async function loadHistory(){
     if (list && !list.children.length) list.innerHTML = '<div class="history-empty">历史状态暂不可用</div>';
   }
 }
+async function clearHistory(){
+  const button = $('clearHistory');
+  if (!button || button.disabled) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '清除中';
+  const clearedAt = Date.now() / 1000;
+  window.localStorage.setItem(HISTORY_CLEAR_KEY, String(clearedAt));
+  renderHistory([]);
+  try {
+    const response = await fetch('api/checkout-history/clear', {method:'POST'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    window.localStorage.setItem(HISTORY_CLEAR_KEY, String(Number(data.cleared_at) || clearedAt));
+  } catch (_) {
+    // Browser-side cutoff keeps older records hidden until the service reloads this route.
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+$('clearHistory').addEventListener('click', clearHistory);
 $('refreshHistory').addEventListener('click', loadHistory);
 $('returnToPay153').addEventListener('click', () => {
   if (window.self !== window.top) {

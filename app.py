@@ -41,6 +41,7 @@ ROOT = Path(__file__).resolve().parent
 BACKEND_LOG_DIR = Path(os.getenv("PAY153_LOG_DIR", str(ROOT / "logs")))
 RUST_ALIAS_FILE = ROOT / "data" / "rust_job_aliases.json"
 CHECKOUT_HISTORY_FILE = ROOT / "data" / "checkout_history.jsonl"
+CHECKOUT_HISTORY_CLEAR_FILE = ROOT / "data" / "checkout_history_clear.json"
 SUCCESS_LINKS_FILE = ROOT / "data" / "success_links.jsonl"
 RUST_ALIAS_LOCK = threading.RLock()
 LEGACY_SERVICE_BASE = str(os.getenv("PAY153_LEGACY_BASE", "")).rstrip("/")
@@ -1406,6 +1407,26 @@ class JobStore:
         except Exception:
             pass
 
+    def clear_history(self) -> float:
+        cleared_at = time.time()
+        CHECKOUT_HISTORY_CLEAR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CHECKOUT_HISTORY_CLEAR_FILE.with_suffix(".tmp")
+        with self.file_lock:
+            temporary.write_text(
+                json.dumps({"cleared_at": cleared_at}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            temporary.replace(CHECKOUT_HISTORY_CLEAR_FILE)
+        return cleared_at
+
+    @staticmethod
+    def _history_cleared_at() -> float:
+        try:
+            payload = json.loads(CHECKOUT_HISTORY_CLEAR_FILE.read_text(encoding="utf-8"))
+            return float(payload.get("cleared_at") or 0)
+        except Exception:
+            return 0.0
+
     def history(self, limit: int = 30) -> list[dict]:
         limit = max(1, min(100, int(limit or 30)))
         records: dict[str, dict] = {}
@@ -1482,8 +1503,13 @@ class JobStore:
                 snapshot = self._history_snapshot(job)
                 if snapshot["id"]:
                     records[snapshot["id"]] = snapshot
+        cleared_at = self._history_cleared_at()
+        visible = [
+            item for item in records.values()
+            if max(float(item.get("updated_at") or 0), float(item.get("created_at") or 0)) > cleared_at
+        ]
         return sorted(
-            records.values(),
+            visible,
             key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0),
             reverse=True,
         )[:limit]
@@ -3635,6 +3661,11 @@ def checkout_history():
     except (TypeError, ValueError):
         limit = 30
     return jsonify({"ok": True, "items": STORE.history(limit)})
+
+
+@app.post("/api/checkout-history/clear")
+def clear_checkout_history():
+    return jsonify({"ok": True, "cleared_at": STORE.clear_history()})
 
 
 @app.post("/api/checkout-cancel")

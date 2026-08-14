@@ -85,6 +85,9 @@ test('starts three account jobs concurrently and switches logs by account', asyn
   assert.equal(window.document.querySelector('#openInRoxy'), null);
   assert.ok(window.document.querySelector('#openPaypalProtocol'));
   assert.ok(window.document.querySelector('#historyList'));
+  assert.ok(window.document.querySelector('#clearHistory'));
+  window.document.querySelector('#clearHistory').click();
+  await waitFor(() => window.document.querySelector('#historyList').textContent.includes('暂无历史提链记录'));
   window.document.querySelector('#checkoutForm').dispatchEvent(new window.Event('submit', {bubbles:true, cancelable:true}));
 
   await waitFor(() => checkoutBodies.length === 3);
